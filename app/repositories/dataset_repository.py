@@ -29,8 +29,18 @@ if IS_POSTGRES:  # pragma: no cover - depende del entorno
     def _get_pool() -> "ConnectionPool":
         global _pool
         if _pool is None:
-            _pool = ConnectionPool(_DATABASE_URL, min_size=1, max_size=5, open=True,
-                                   kwargs={"autocommit": True})
+            _pool = ConnectionPool(
+                _DATABASE_URL,
+                min_size=1,
+                max_size=5,
+                open=True,
+                kwargs={"autocommit": True},
+                # Neon cierra conexiones ociosas (autosuspende el compute). Validar y
+                # reconectar antes de entregar la conexión evita el error
+                # "SSL connection has been closed unexpectedly".
+                check=ConnectionPool.check_connection,
+                max_idle=120,
+            )
         return _pool
 
 # Tipos portables entre SQLite y Postgres (BIGINT tiene afinidad INTEGER en SQLite).

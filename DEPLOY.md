@@ -32,7 +32,7 @@ Vercel (frontend React)  ──HTTPS──►  Railway (FastAPI + DuckDB)  ─�
 ## 2. Railway (backend)
 
 1. En [railway.app](https://railway.app) → **New Project → Deploy from GitHub repo** → elige `datafilter-backend`.
-2. Railway detecta el `Dockerfile` y `railway.json` (healthcheck en `/health`).
+2. Railway detecta el `Dockerfile` y `railway.json ` (healthcheck en `/health`).
 3. En **Variables**, agrega:
 
    | Variable | Valor |
