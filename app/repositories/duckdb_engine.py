@@ -8,7 +8,9 @@ Notas de seguridad:
     Nunca provienen de datos del usuario.
   - Los VALORES de filtro se pasan SIEMPRE como parámetros ('?') enlazados.
 """
+import zipfile
 from pathlib import Path
+from xml.etree import ElementTree
 
 import duckdb
 
@@ -17,6 +19,8 @@ from app.schemas.dataset import ColumnInfo
 CSV_EXTENSIONS = {".csv", ".txt"}
 EXCEL_EXTENSIONS = {".xlsx", ".xls"}
 
+_XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+
 
 def _sql_path(path: Path) -> str:
     """Literal SQL seguro para una ruta controlada por el servidor."""
@@ -24,16 +28,46 @@ def _sql_path(path: Path) -> str:
     return f"'{posix}'"
 
 
-def _reader_expr(source: Path) -> str:
-    """Expresión de tabla DuckDB para leer el archivo según su extensión."""
+def _sql_str(value: str) -> str:
+    """Literal SQL seguro para una cadena (escapa comillas simples)."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _reader_expr(source: Path, sheet: str | None = None) -> str:
+    """Expresión de tabla DuckDB para leer el archivo según su extensión.
+
+    - CSV/TXT: auto-detecta delimitador, tipos y presencia de cabecera.
+    - Excel: lee la hoja indicada (o la primera) asumiendo cabecera.
+    """
     ext = source.suffix.lower()
     literal = _sql_path(source)
     if ext in CSV_EXTENSIONS:
-        # auto-detección de delimitador, tipos y cabecera.
-        return f"read_csv_auto({literal}, header = true)"
+        return f"read_csv_auto({literal})"
     if ext in EXCEL_EXTENSIONS:
-        return f"read_xlsx({literal}, header = true)"
+        sheet_clause = f", sheet = {_sql_str(sheet)}" if sheet else ""
+        return f"read_xlsx({literal}, header = true{sheet_clause})"
     raise ValueError(f"Extensión no soportada: {ext}")
+
+
+def list_xlsx_sheets(source: Path) -> list[str]:
+    """Devuelve los nombres de hoja de un .xlsx leyendo su workbook.xml (sin dependencias).
+
+    Un .xlsx es un ZIP; las hojas se declaran en 'xl/workbook.xml'. Si el archivo
+    no es un ZIP válido (p. ej. .xls antiguo), devuelve lista vacía.
+    """
+    if not zipfile.is_zipfile(source):
+        return []
+    try:
+        with zipfile.ZipFile(source) as archive:
+            root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    except (KeyError, zipfile.BadZipFile, ElementTree.ParseError):
+        return []
+    namespace = {"main": _XLSX_MAIN_NS}
+    return [
+        name
+        for sheet in root.findall(".//main:sheets/main:sheet", namespace)
+        if (name := sheet.get("name"))
+    ]
 
 
 def _connect() -> duckdb.DuckDBPyConnection:
@@ -49,12 +83,15 @@ def _connect() -> duckdb.DuckDBPyConnection:
     return con
 
 
-def convert_to_parquet(source: Path, dest: Path) -> tuple[list[ColumnInfo], int]:
+def convert_to_parquet(
+    source: Path, dest: Path, sheet: str | None = None
+) -> tuple[list[ColumnInfo], int]:
     """Convierte el archivo subido a Parquet columnar. Devuelve (columnas, filas).
 
     La conversión se hace vía COPY en streaming: DuckDB no carga todo en RAM.
+    `sheet` solo aplica a Excel; para CSV/TXT se ignora.
     """
-    reader = _reader_expr(source)
+    reader = _reader_expr(source, sheet)
     with _connect() as con:
         con.execute(f"COPY (SELECT * FROM {reader}) TO {_sql_path(dest)} (FORMAT PARQUET)")
         columns = _describe(con, dest)
@@ -127,3 +164,33 @@ def export_to_file(
     sql = f"COPY ({inner}) TO {_sql_path(dest)} {copy_opts}"
     with _connect() as con:
         con.execute(sql, params)
+
+
+def distinct_values(
+    parquet: Path,
+    column_sql: str,
+    search: str | None,
+    limit: int,
+) -> tuple[list, bool]:
+    """Valores únicos de una columna (para el filtro tipo Excel).
+
+    `column_sql` debe venir ya validado/citado por el query-builder (whitelist).
+    El texto de búsqueda va como parámetro enlazado. Se pide un valor extra para
+    saber si la lista quedó truncada.
+    """
+    filter_clause = ""
+    query_params: list = []
+    if search:
+        filter_clause = f"AND CAST({column_sql} AS VARCHAR) ILIKE ?"
+        query_params.append(f"%{search}%")
+    sql = (
+        f"SELECT DISTINCT {column_sql} AS value "
+        f"FROM read_parquet({_sql_path(parquet)}) "
+        f"WHERE {column_sql} IS NOT NULL {filter_clause} "
+        f"ORDER BY value LIMIT {int(limit) + 1}"
+    )
+    with _connect() as con:
+        rows = con.execute(sql, query_params).fetchall()
+    values = [row[0] for row in rows]
+    truncated = len(values) > limit
+    return values[:limit], truncated

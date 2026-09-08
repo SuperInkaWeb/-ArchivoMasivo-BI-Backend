@@ -29,10 +29,17 @@ class DatasetSummary(BaseModel):
 
 
 class DatasetDetail(DatasetSummary):
-    """Detalle con esquema de columnas."""
+    """Detalle con esquema de columnas y hojas (si es Excel multi-hoja)."""
     columns: list[ColumnInfo] = Field(default_factory=list)
+    sheets: list[str] = Field(default_factory=list)
+    active_sheet: str | None = None
 
 
 class UploadResult(BaseModel):
     """Respuesta al subir uno o varios archivos."""
     datasets: list[DatasetSummary]
+
+
+class SheetSelection(BaseModel):
+    """Petición para re-ingerir un Excel usando una hoja específica."""
+    sheet: str

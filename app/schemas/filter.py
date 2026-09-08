@@ -1,10 +1,15 @@
-"""DTOs de filtrado.
+"""DTOs de filtrado (árbol recursivo con grupos anidados).
 
-El conjunto de operadores es un enum CERRADO: cualquier operador fuera de
-esta lista es rechazado por validación de pydantic antes de tocar la BD.
-Esto es parte central de la defensa contra inyección (A03).
+Un filtro es un ÁRBOL de nodos:
+  - FilterLeaf  = una condición sobre una columna (hoja).
+  - FilterGroup = un conector (AND/OR) con hijos, que pueden ser hojas u otros grupos.
+
+Esto permite lógica anidada como "(region = Lima Y monto > 1000) O tipo = 08".
+El conjunto de operadores es un enum CERRADO: cualquier operador fuera de la lista
+es rechazado por validación antes de tocar la BD (defensa contra inyección, A03).
 """
 from enum import Enum
+from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, Field
 
@@ -37,11 +42,28 @@ class SortDirection(str, Enum):
     DESC = "desc"
 
 
-class FilterCondition(BaseModel):
+FilterValue = str | int | float | bool | list[str | int | float] | None
+
+
+class FilterLeaf(BaseModel):
+    """Hoja: una condición sobre una columna."""
+    type: Literal["condition"] = "condition"
     column: str
     operator: Operator
     # value: escalar para la mayoría; lista para IN/NOT_IN/BETWEEN; ausente para IS_NULL.
-    value: str | int | float | bool | list[str | int | float] | None = None
+    value: FilterValue = None
+
+
+class FilterGroup(BaseModel):
+    """Grupo: un conector (AND/OR) con hijos (hojas u otros grupos)."""
+    type: Literal["group"] = "group"
+    combinator: Combinator = Combinator.AND
+    children: list["FilterNode"] = Field(default_factory=list)
+
+
+# Unión discriminada por el campo "type"; recursiva vía FilterGroup.children.
+FilterNode = Annotated[Union[FilterLeaf, FilterGroup], Field(discriminator="type")]
+FilterGroup.model_rebuild()
 
 
 class SortSpec(BaseModel):
@@ -50,8 +72,8 @@ class SortSpec(BaseModel):
 
 
 class FilterRequest(BaseModel):
-    conditions: list[FilterCondition] = Field(default_factory=list)
-    combinator: Combinator = Combinator.AND
+    # Árbol raíz de filtros; None (o grupo vacío) = sin filtro (todas las filas).
+    filter: FilterGroup | None = None
     # Columnas a devolver; vacío = todas.
     select: list[str] = Field(default_factory=list)
     sort: list[SortSpec] = Field(default_factory=list)
@@ -77,3 +99,14 @@ class DownloadFormat(str, Enum):
 
 class DownloadRequest(FilterRequest):
     format: DownloadFormat = DownloadFormat.CSV
+
+
+class DistinctValuesResponse(BaseModel):
+    """Valores únicos de una columna para el filtro tipo Excel.
+
+    Los valores se devuelven como texto para un contrato simple; el cliente los
+    coacciona al tipo real de la columna al construir el filtro.
+    """
+    column: str
+    values: list[str]
+    truncated: bool  # true si hay más valores de los devueltos

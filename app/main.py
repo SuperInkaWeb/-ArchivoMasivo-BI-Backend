@@ -14,9 +14,11 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from app.core.config import get_settings
 from app.core.exceptions import (
+    AuthError,
     DatasetNotFoundError,
     DatasetNotReadyError,
     DownloadTooLargeError,
+    InvalidSheetError,
 )
 from app.core.query_builder import InvalidFilterError
 from app.core.rate_limit import limiter
@@ -86,6 +88,16 @@ def _register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(DownloadTooLargeError)
     async def _too_large(_: Request, exc: DownloadTooLargeError) -> JSONResponse:
         return _json_error(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, str(exc))
+
+    @app.exception_handler(InvalidSheetError)
+    async def _bad_sheet(_: Request, exc: InvalidSheetError) -> JSONResponse:
+        return _json_error(status.HTTP_400_BAD_REQUEST, str(exc))
+
+    @app.exception_handler(AuthError)
+    async def _auth(_: Request, exc: AuthError) -> JSONResponse:
+        response = _json_error(status.HTTP_401_UNAUTHORIZED, str(exc))
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
 
     @app.exception_handler(UnsupportedFileTypeError)
     async def _bad_type(_: Request, exc: UnsupportedFileTypeError) -> JSONResponse:

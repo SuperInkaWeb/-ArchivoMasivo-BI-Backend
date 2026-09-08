@@ -15,3 +15,11 @@ class DatasetNotReadyError(Exception):
 
 class DownloadTooLargeError(Exception):
     """El resultado filtrado excede el límite permitido de descarga."""
+
+
+class InvalidSheetError(Exception):
+    """La hoja solicitada no existe en el archivo Excel."""
+
+
+class AuthError(Exception):
+    """Falta autenticación o el token es inválido/expirado."""

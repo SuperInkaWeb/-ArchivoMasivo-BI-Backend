@@ -32,14 +32,14 @@ class ExportResult:
     download_filename: str
 
 
-def build_export(dataset_id: str, request: DownloadRequest) -> ExportResult:
+def build_export(dataset_id: str, request: DownloadRequest, owner_id: str) -> ExportResult:
     """Genera el archivo filtrado en disco y devuelve cómo transmitirlo."""
-    detail = get_dataset(dataset_id)
+    detail = get_dataset(dataset_id, owner_id)
     if detail.status is not IngestStatus.READY:
         raise DatasetNotReadyError(f"Dataset en estado '{detail.status.value}'")
     valid_columns = {col.name for col in detail.columns}
 
-    where_sql, params = build_where(request.conditions, request.combinator, valid_columns)
+    where_sql, params = build_where(request.filter, valid_columns)
     select_sql = build_select(request.select, valid_columns)
     order_sql = build_order_by(request.sort, valid_columns)
     parquet = parquet_path(dataset_id)
