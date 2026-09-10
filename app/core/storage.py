@@ -38,10 +38,42 @@ def metadata_db_path() -> Path:
 
 
 def upload_path(dataset_id: str, extension: str) -> Path:
-    """Ruta del archivo original subido. El ID es un UUID del servidor."""
+    """Ruta LOCAL del archivo original subido. El ID es un UUID del servidor."""
     safe_ext = extension.lstrip(".").lower()
     return uploads_dir() / f"{dataset_id}.{safe_ext}"
 
 
 def parquet_path(dataset_id: str) -> Path:
+    """Ruta LOCAL del Parquet."""
     return parquet_dir() / f"{dataset_id}.parquet"
+
+
+# ---------------------------------------------------------------------------
+# Claves de objeto (para R2) y "locators" abstractos que consume DuckDB.
+# Un locator es o una ruta local (str) o una URI 's3://bucket/clave'.
+# ---------------------------------------------------------------------------
+
+def upload_key(dataset_id: str, extension: str) -> str:
+    safe_ext = extension.lstrip(".").lower()
+    return f"uploads/{dataset_id}.{safe_ext}"
+
+
+def parquet_key(dataset_id: str) -> str:
+    return f"parquet/{dataset_id}.parquet"
+
+
+def _s3_uri(key: str) -> str:
+    return f"s3://{get_settings().r2_bucket}/{key}"
+
+
+def upload_locator(dataset_id: str, extension: str) -> str:
+    """Locator del archivo original: URI s3:// en R2, o ruta local si no."""
+    if get_settings().use_r2:
+        return _s3_uri(upload_key(dataset_id, extension))
+    return str(upload_path(dataset_id, extension))
+
+
+def parquet_locator(dataset_id: str) -> str:
+    if get_settings().use_r2:
+        return _s3_uri(parquet_key(dataset_id))
+    return str(parquet_path(dataset_id))

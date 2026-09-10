@@ -1,22 +1,40 @@
-"""Orquestación de datasets: subir, listar, obtener esquema y previsualizar filtrado."""
+"""Orquestación de datasets: subir (2 pasos), listar, esquema, previsualizar y descargar.
+
+La subida es en dos pasos para soportar archivos grandes:
+  1. create_upload  -> devuelve una URL a la que el navegador sube el archivo
+     (URL prefirmada de R2, o un endpoint local del backend en modo disco).
+  2. confirm_uploaded -> el backend dispara la ingesta (conversión a Parquet).
+"""
 import uuid
 
 import aiofiles
-from fastapi import UploadFile
+from fastapi import Request
 
 from app.core.config import get_settings
 from app.core.exceptions import DatasetNotFoundError, DatasetNotReadyError, InvalidSheetError
 from app.core.query_builder import build_order_by, build_select, build_where, quote_column
-from app.core.storage import parquet_path, upload_path
+from app.core.storage import (
+    parquet_key,
+    parquet_locator,
+    parquet_path,
+    upload_key,
+    upload_locator,
+    upload_path,
+)
 from app.repositories import dataset_repository as repo
-from app.repositories import duckdb_engine
-from app.schemas.dataset import DatasetDetail, DatasetSummary, IngestStatus
+from app.repositories import duckdb_engine, r2_client
+from app.schemas.dataset import (
+    DatasetDetail,
+    DatasetSummary,
+    IngestStatus,
+    UploadTicket,
+)
 from app.schemas.filter import DistinctValuesResponse, PreviewRequest, PreviewResponse
 
 _DISTINCT_VALUES_LIMIT = 500  # tope de valores en el desplegable tipo Excel
 
 _ALLOWED_EXTENSIONS = {".csv", ".txt", ".xlsx", ".xls"}
-_CHUNK_SIZE = 1024 * 1024  # 1 MB por bloque al guardar en disco
+_CHUNK_SIZE = 1024 * 1024  # 1 MB por bloque al guardar en disco (modo local)
 
 
 class UnsupportedFileTypeError(Exception):
@@ -32,35 +50,67 @@ def _extension_of(filename: str) -> str:
     return filename[dot:].lower() if dot != -1 else ""
 
 
-async def save_upload(file: UploadFile, owner_id: str) -> DatasetSummary:
-    """Guarda un archivo subido en disco (streaming) y crea su registro PENDING.
+# ---------------------------------------------------------------------------
+# Subida en dos pasos
+# ---------------------------------------------------------------------------
 
-    Valida extensión y tamaño. El ID es un UUID del servidor: el nombre original
-    del usuario nunca se usa para construir rutas (mitiga Path Traversal).
-    El dataset queda ligado a `owner_id` (usuario de Auth0).
-    """
-    original_name = file.filename or "sin_nombre"
-    extension = _extension_of(original_name)
+def create_upload(filename: str, owner_id: str) -> UploadTicket:
+    """Paso 1: valida, crea el registro PENDING y devuelve a dónde subir el archivo."""
+    extension = _extension_of(filename)
     if extension not in _ALLOWED_EXTENSIONS:
         raise UnsupportedFileTypeError(f"Tipo no permitido: {extension or 'desconocido'}")
 
-    settings = get_settings()
     dataset_id = uuid.uuid4().hex
+    repo.create(dataset_id, owner_id, filename, extension, size_bytes=0)
+
+    if get_settings().use_r2:
+        upload_url = r2_client.presign_put(upload_key(dataset_id, extension))
+        direct = True
+    else:
+        upload_url = f"/datasets/{dataset_id}/raw"  # el navegador lo resuelve contra la API
+        direct = False
+
+    return UploadTicket(
+        dataset=repo.get_detail(dataset_id, owner_id),
+        upload_url=upload_url,
+        direct_to_storage=direct,
+    )
+
+
+async def save_raw_local(dataset_id: str, owner_id: str, request: Request) -> None:
+    """Modo local: recibe el cuerpo del PUT y lo guarda en disco (streaming)."""
+    detail = get_dataset(dataset_id, owner_id)  # valida propiedad
+    extension = _extension_of(detail.original_filename)
+    settings = get_settings()
     destination = upload_path(dataset_id, extension)
 
     written = 0
     async with aiofiles.open(destination, "wb") as out:
-        while chunk := await file.read(_CHUNK_SIZE):
+        async for chunk in request.stream():
+            if not chunk:
+                continue
             written += len(chunk)
             if written > settings.max_upload_bytes:
                 await out.close()
                 destination.unlink(missing_ok=True)
                 raise FileTooLargeError(f"El archivo supera {settings.max_upload_mb} MB")
             await out.write(chunk)
+    repo.set_size(dataset_id, written)
 
-    repo.create(dataset_id, owner_id, original_name, extension, written)
-    return repo.get_detail(dataset_id, owner_id)  # PENDING recién creado
 
+def confirm_uploaded(dataset_id: str, owner_id: str) -> DatasetSummary:
+    """Paso 2: valida y (para R2) registra el tamaño. El router dispara la ingesta."""
+    detail = get_dataset(dataset_id, owner_id)
+    if get_settings().use_r2:
+        size = r2_client.object_size(upload_key(dataset_id, _extension_of(detail.original_filename)))
+        if size is not None:
+            repo.set_size(dataset_id, size)
+    return repo.get_detail(dataset_id, owner_id)
+
+
+# ---------------------------------------------------------------------------
+# Lectura / gestión
+# ---------------------------------------------------------------------------
 
 def list_datasets(owner_id: str) -> list[DatasetSummary]:
     return repo.list_all(owner_id)
@@ -81,13 +131,26 @@ def _require_ready(dataset_id: str, owner_id: str) -> DatasetDetail:
 
 
 def delete_dataset(dataset_id: str, owner_id: str) -> None:
-    if repo.get_detail(dataset_id, owner_id) is None:
+    detail = repo.get_detail(dataset_id, owner_id)
+    if detail is None:
         raise DatasetNotFoundError(dataset_id)
     extension = repo.get_extension(dataset_id)
-    if extension:
-        upload_path(dataset_id, extension).unlink(missing_ok=True)
-    parquet_path(dataset_id).unlink(missing_ok=True)
+    if get_settings().use_r2:
+        if extension:
+            _r2_delete_quiet(upload_key(dataset_id, extension))
+        _r2_delete_quiet(parquet_key(dataset_id))
+    else:
+        if extension:
+            upload_path(dataset_id, extension).unlink(missing_ok=True)
+        parquet_path(dataset_id).unlink(missing_ok=True)
     repo.delete(dataset_id, owner_id)
+
+
+def _r2_delete_quiet(key: str) -> None:
+    try:
+        r2_client.delete_object(key)
+    except Exception:  # noqa: BLE001 - limpieza best-effort
+        pass
 
 
 def preview(dataset_id: str, request: PreviewRequest, owner_id: str) -> PreviewResponse:
@@ -98,7 +161,7 @@ def preview(dataset_id: str, request: PreviewRequest, owner_id: str) -> PreviewR
     where_sql, params = build_where(request.filter, valid_columns)
     select_sql = build_select(request.select, valid_columns)
     order_sql = build_order_by(request.sort, valid_columns)
-    parquet = parquet_path(dataset_id)
+    parquet = parquet_locator(dataset_id)
 
     column_names, rows = duckdb_engine.preview(
         parquet, select_sql, where_sql, order_sql, request.limit, request.offset, params
@@ -121,7 +184,7 @@ def distinct_values(
     valid_columns = {col.name for col in detail.columns}
     column_sql = quote_column(column, valid_columns)  # valida contra whitelist
     values, truncated = duckdb_engine.distinct_values(
-        parquet_path(dataset_id), column_sql, search, _DISTINCT_VALUES_LIMIT
+        parquet_locator(dataset_id), column_sql, search, _DISTINCT_VALUES_LIMIT
     )
     return DistinctValuesResponse(
         column=column,

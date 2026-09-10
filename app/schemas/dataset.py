@@ -35,9 +35,20 @@ class DatasetDetail(DatasetSummary):
     active_sheet: str | None = None
 
 
-class UploadResult(BaseModel):
-    """Respuesta al subir uno o varios archivos."""
-    datasets: list[DatasetSummary]
+class UploadUrlRequest(BaseModel):
+    """Petición para iniciar una subida: solo el nombre del archivo."""
+    filename: str
+
+
+class UploadTicket(BaseModel):
+    """Respuesta con la URL a la que el navegador debe subir (PUT) el archivo.
+
+    - direct_to_storage=true: `upload_url` es una URL prefirmada de R2 (subida directa).
+    - direct_to_storage=false: `upload_url` es una ruta relativa del backend (modo local).
+    """
+    dataset: DatasetSummary
+    upload_url: str
+    direct_to_storage: bool
 
 
 class SheetSelection(BaseModel):

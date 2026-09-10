@@ -17,6 +17,15 @@ class Settings(BaseSettings):
     # Metadatos: si DATABASE_URL está definida se usa Postgres/Neon; si no, SQLite local.
     database_url: str = ""
 
+    # Almacenamiento de archivos. Si las 4 variables R2 están definidas se usa
+    # Cloudflare R2 (subida directa + Parquet en R2); si no, disco local.
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket: str = ""
+    # Minutos de validez de la URL prefirmada de subida.
+    r2_presign_expiry_minutes: int = 30
+
     # Límites de recursos (defensa contra abuso / OWASP A04)
     max_upload_mb: int = 2048
     max_download_rows: int = 5_000_000
@@ -46,6 +55,19 @@ class Settings(BaseSettings):
     @property
     def auth0_jwks_url(self) -> str:
         return f"https://{self.auth0_domain}/.well-known/jwks.json"
+
+    @property
+    def use_r2(self) -> bool:
+        return bool(
+            self.r2_account_id
+            and self.r2_access_key_id
+            and self.r2_secret_access_key
+            and self.r2_bucket
+        )
+
+    @property
+    def r2_endpoint(self) -> str:
+        return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"
 
     @property
     def max_upload_bytes(self) -> int:

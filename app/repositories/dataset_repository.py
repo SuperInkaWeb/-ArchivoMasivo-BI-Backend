@@ -127,6 +127,14 @@ def set_sheets(dataset_id: str, sheets: list[str], active_sheet: str | None) -> 
         )
 
 
+def set_size(dataset_id: str, size_bytes: int) -> None:
+    with _cursor() as cursor:
+        cursor.execute(
+            f"UPDATE datasets SET size_bytes = {_PH}, updated_at = {_PH} WHERE id = {_PH}",
+            (size_bytes, _now(), dataset_id),
+        )
+
+
 def set_status(dataset_id: str, status: IngestStatus, error: str | None = None) -> None:
     with _cursor() as cursor:
         cursor.execute(

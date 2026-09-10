@@ -10,7 +10,7 @@ from pathlib import Path
 from app.core.config import get_settings
 from app.core.exceptions import DatasetNotReadyError, DownloadTooLargeError
 from app.core.query_builder import build_order_by, build_select, build_where
-from app.core.storage import exports_dir, parquet_path
+from app.core.storage import exports_dir, parquet_locator
 from app.repositories import duckdb_engine
 from app.schemas.dataset import IngestStatus
 from app.schemas.filter import DownloadFormat, DownloadRequest
@@ -42,14 +42,15 @@ def build_export(dataset_id: str, request: DownloadRequest, owner_id: str) -> Ex
     where_sql, params = build_where(request.filter, valid_columns)
     select_sql = build_select(request.select, valid_columns)
     order_sql = build_order_by(request.sort, valid_columns)
-    parquet = parquet_path(dataset_id)
+    parquet = parquet_locator(dataset_id)  # ruta local o s3://... según el modo
 
     matched = duckdb_engine.count_matches(parquet, where_sql, params)
     _guard_limits(matched, request.format)
 
+    # El resultado filtrado se escribe SIEMPRE a un temporal local para transmitirlo.
     dest = exports_dir() / f"{dataset_id}_{uuid.uuid4().hex}.{request.format.value}"
     duckdb_engine.export_to_file(
-        parquet, select_sql, where_sql, order_sql, params, dest, request.format.value
+        parquet, select_sql, where_sql, order_sql, params, str(dest), request.format.value
     )
 
     base_name = _sanitize_stem(detail.original_filename)

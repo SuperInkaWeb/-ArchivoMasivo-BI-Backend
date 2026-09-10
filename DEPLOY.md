@@ -86,6 +86,44 @@ Abre la URL de Vercel → **Iniciar sesión** → entras con tu usuario de Auth0
 
 ---
 
+## 6. Cloudflare R2 (almacenamiento de archivos) — recomendado para archivos grandes
+
+Sin R2, los archivos viven en el disco **efímero** de Railway y las subidas de varios GB fallan
+(timeout del proxy). Con R2, el navegador sube **directo** al bucket (sin pasar por Railway) y
+DuckDB lee/escribe el Parquet en R2. Si no defines las 4 variables R2, el backend usa disco local.
+
+1. **Crea el bucket** en Cloudflare → **R2** → *Create bucket* (p. ej. `archivomasivo-bi`).
+2. **Crea un API Token de R2** (R2 → *Manage R2 API Tokens* → Create) con permiso **Object Read & Write**
+   sobre ese bucket. Te da **Access Key ID** y **Secret Access Key**.
+3. **Account ID:** aparece en la página principal de R2 (o en el endpoint `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`).
+4. En **Railway → Variables** agrega:
+
+   | Variable | Valor |
+   |---|---|
+   | `R2_ACCOUNT_ID` | tu Account ID de Cloudflare |
+   | `R2_ACCESS_KEY_ID` | Access Key del token R2 |
+   | `R2_SECRET_ACCESS_KEY` | Secret del token R2 |
+   | `R2_BUCKET` | nombre del bucket (`archivomasivo-bi`) |
+
+5. **⚠️ CORS del bucket (imprescindible)** — para que el navegador pueda subir directo:
+   R2 → tu bucket → **Settings → CORS Policy** → pega:
+   ```json
+   [
+     {
+       "AllowedOrigins": ["https://archivo-masivo-bi-frontend.vercel.app", "http://localhost:5173"],
+       "AllowedMethods": ["PUT"],
+       "AllowedHeaders": ["content-type"],
+       "MaxAgeSeconds": 3600
+     }
+   ]
+   ```
+6. Railway redepliega solo al guardar las variables. Listo: las subidas grandes van directo a R2.
+
+> El token R2 va **solo en Railway** (backend), nunca en el frontend. El frontend recibe una
+> URL prefirmada temporal para cada subida.
+
+---
+
 ## Referencia rápida de variables
 
 **Backend (Railway):** `DATABASE_URL`, `AUTH_ENABLED`, `AUTH0_DOMAIN`, `AUTH0_AUDIENCE`, `CORS_ORIGINS`, `MAX_UPLOAD_MB`, `MAX_DOWNLOAD_ROWS`.

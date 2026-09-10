@@ -1,14 +1,24 @@
-"""Router de datasets: subir (multi-archivo), listar, detalle y eliminar.
+"""Router de datasets: subir (2 pasos), listar, detalle, valores, hoja y eliminar.
 
-Solo recibe la petición y delega en el service. Sin lógica de negocio aquí.
-Todos los endpoints requieren autenticación (Auth0) y operan sobre los datos
-del usuario autenticado (aislamiento por owner_id).
+Solo recibe la petición y delega en el service. Todos los endpoints requieren
+autenticación (Auth0) y operan sobre los datos del usuario (aislamiento por owner_id).
+
+Subida en dos pasos (para archivos grandes):
+  1. POST /datasets/upload-url  -> devuelve la URL a la que subir el archivo.
+  2. el navegador sube el archivo (a R2 directo, o a PUT /datasets/{id}/raw en local).
+  3. POST /datasets/{id}/uploaded -> dispara la ingesta.
 """
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 
 from app.core.rate_limit import limiter, upload_limit
 from app.core.security import CurrentUser, get_current_user
-from app.schemas.dataset import DatasetDetail, DatasetSummary, SheetSelection, UploadResult
+from app.schemas.dataset import (
+    DatasetDetail,
+    DatasetSummary,
+    SheetSelection,
+    UploadTicket,
+    UploadUrlRequest,
+)
 from app.schemas.filter import DistinctValuesResponse
 from app.services import dataset_service
 from app.services.ingest_service import run_ingest
@@ -16,21 +26,37 @@ from app.services.ingest_service import run_ingest
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
 
-@router.post("/upload", response_model=UploadResult, status_code=status.HTTP_201_CREATED)
+@router.post("/upload-url", response_model=UploadTicket, status_code=status.HTTP_201_CREATED)
 @limiter.limit(upload_limit)
-async def upload_datasets(
+async def create_upload_url(
     request: Request,
-    background_tasks: BackgroundTasks,
-    files: list[UploadFile],
+    body: UploadUrlRequest,
     user: CurrentUser = Depends(get_current_user),
-) -> UploadResult:
-    """Sube uno o varios archivos. Cada uno se ingesta en background (async)."""
-    created: list[DatasetSummary] = []
-    for file in files:
-        summary = await dataset_service.save_upload(file, user.sub)
-        background_tasks.add_task(run_ingest, summary.id)
-        created.append(summary)
-    return UploadResult(datasets=created)
+) -> UploadTicket:
+    """Paso 1: crea el dataset y devuelve la URL de subida (prefirmada de R2 o local)."""
+    return dataset_service.create_upload(body.filename, user.sub)
+
+
+@router.put("/{dataset_id}/raw", status_code=status.HTTP_204_NO_CONTENT)
+async def upload_raw(
+    dataset_id: str,
+    request: Request,
+    user: CurrentUser = Depends(get_current_user),
+) -> None:
+    """Modo local: recibe el archivo (cuerpo del PUT) y lo guarda en disco."""
+    await dataset_service.save_raw_local(dataset_id, user.sub, request)
+
+
+@router.post("/{dataset_id}/uploaded", response_model=DatasetSummary, status_code=status.HTTP_202_ACCEPTED)
+async def confirm_upload(
+    dataset_id: str,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(get_current_user),
+) -> DatasetSummary:
+    """Paso 3: confirma la subida y dispara la ingesta (conversión a Parquet)."""
+    summary = dataset_service.confirm_uploaded(dataset_id, user.sub)
+    background_tasks.add_task(run_ingest, dataset_id)
+    return summary
 
 
 @router.get("", response_model=list[DatasetSummary])

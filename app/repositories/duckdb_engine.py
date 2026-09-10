@@ -1,19 +1,22 @@
-"""Acceso a datos vía DuckDB sobre archivos Parquet.
+"""Acceso a datos vía DuckDB sobre archivos Parquet (en disco local o en R2/S3).
 
 Responsabilidad única: ejecutar contra DuckDB. No conoce reglas de negocio.
 
+Un "locator" es una cadena que apunta al archivo: o una ruta local, o una URI
+`s3://bucket/clave` (Cloudflare R2). DuckDB lee/escribe ambos de forma transparente
+gracias a la extensión httpfs, que se configura en `_connect()` cuando R2 está activo.
+
 Notas de seguridad:
-  - Las RUTAS de archivo se inyectan al SQL solo cuando son generadas por el
-    servidor (UUID bajo el directorio de datos), y se escapan/normalizan.
-    Nunca provienen de datos del usuario.
+  - Los locators los genera el servidor (UUID/claves fijas), nunca datos del usuario;
+    se escapan/normalizan antes de inyectarse como literal SQL.
   - Los VALORES de filtro se pasan SIEMPRE como parámetros ('?') enlazados.
 """
 import zipfile
-from pathlib import Path
 from xml.etree import ElementTree
 
 import duckdb
 
+from app.core.config import get_settings
 from app.schemas.dataset import ColumnInfo
 
 CSV_EXTENSIONS = {".csv", ".txt"}
@@ -22,10 +25,10 @@ EXCEL_EXTENSIONS = {".xlsx", ".xls"}
 _XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
 
-def _sql_path(path: Path) -> str:
-    """Literal SQL seguro para una ruta controlada por el servidor."""
-    posix = str(path).replace("\\", "/").replace("'", "''")
-    return f"'{posix}'"
+def _sql_path(locator: str) -> str:
+    """Literal SQL seguro para un locator controlado por el servidor (ruta o s3://)."""
+    normalized = str(locator).replace("\\", "/").replace("'", "''")
+    return f"'{normalized}'"
 
 
 def _sql_str(value: str) -> str:
@@ -33,13 +36,13 @@ def _sql_str(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _reader_expr(source: Path, sheet: str | None = None) -> str:
+def _reader_expr(source: str, extension: str, sheet: str | None = None) -> str:
     """Expresión de tabla DuckDB para leer el archivo según su extensión.
 
     - CSV/TXT: auto-detecta delimitador, tipos y presencia de cabecera.
     - Excel: lee la hoja indicada (o la primera) asumiendo cabecera.
     """
-    ext = source.suffix.lower()
+    ext = extension.lower()
     literal = _sql_path(source)
     if ext in CSV_EXTENSIONS:
         return f"read_csv_auto({literal})"
@@ -49,16 +52,16 @@ def _reader_expr(source: Path, sheet: str | None = None) -> str:
     raise ValueError(f"Extensión no soportada: {ext}")
 
 
-def list_xlsx_sheets(source: Path) -> list[str]:
-    """Devuelve los nombres de hoja de un .xlsx leyendo su workbook.xml (sin dependencias).
+def list_xlsx_sheets(local_path: str) -> list[str]:
+    """Nombres de hoja de un .xlsx LOCAL leyendo su workbook.xml (sin dependencias).
 
-    Un .xlsx es un ZIP; las hojas se declaran en 'xl/workbook.xml'. Si el archivo
-    no es un ZIP válido (p. ej. .xls antiguo), devuelve lista vacía.
+    Recibe una ruta local (para R2, el llamador descarga el archivo primero). Si no
+    es un ZIP válido (p. ej. .xls antiguo), devuelve lista vacía.
     """
-    if not zipfile.is_zipfile(source):
+    if not zipfile.is_zipfile(local_path):
         return []
     try:
-        with zipfile.ZipFile(source) as archive:
+        with zipfile.ZipFile(local_path) as archive:
             root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
     except (KeyError, zipfile.BadZipFile, ElementTree.ParseError):
         return []
@@ -80,18 +83,30 @@ def _connect() -> duckdb.DuckDBPyConnection:
         con.execute("LOAD excel")
     except duckdb.Error:
         pass  # sin excel: CSV/TXT siguen funcionando
+
+    settings = get_settings()
+    if settings.use_r2:
+        # httpfs permite leer/escribir s3://... (R2 es compatible con S3).
+        con.execute("INSTALL httpfs")
+        con.execute("LOAD httpfs")
+        con.execute(f"SET s3_endpoint={_sql_str(f'{settings.r2_account_id}.r2.cloudflarestorage.com')}")
+        con.execute(f"SET s3_access_key_id={_sql_str(settings.r2_access_key_id)}")
+        con.execute(f"SET s3_secret_access_key={_sql_str(settings.r2_secret_access_key)}")
+        con.execute("SET s3_region='auto'")
+        con.execute("SET s3_url_style='path'")
+        con.execute("SET s3_use_ssl=true")
     return con
 
 
 def convert_to_parquet(
-    source: Path, dest: Path, sheet: str | None = None
+    source: str, dest: str, extension: str, sheet: str | None = None
 ) -> tuple[list[ColumnInfo], int]:
-    """Convierte el archivo subido a Parquet columnar. Devuelve (columnas, filas).
+    """Convierte el archivo original a Parquet columnar. Devuelve (columnas, filas).
 
     La conversión se hace vía COPY en streaming: DuckDB no carga todo en RAM.
     `sheet` solo aplica a Excel; para CSV/TXT se ignora.
     """
-    reader = _reader_expr(source, sheet)
+    reader = _reader_expr(source, extension, sheet)
     with _connect() as con:
         con.execute(f"COPY (SELECT * FROM {reader}) TO {_sql_path(dest)} (FORMAT PARQUET)")
         columns = _describe(con, dest)
@@ -99,18 +114,18 @@ def convert_to_parquet(
     return columns, int(row_count)
 
 
-def _describe(con: duckdb.DuckDBPyConnection, parquet: Path) -> list[ColumnInfo]:
+def _describe(con: duckdb.DuckDBPyConnection, parquet: str) -> list[ColumnInfo]:
     rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet({_sql_path(parquet)})").fetchall()
     # DESCRIBE => (column_name, column_type, null, key, default, extra)
     return [ColumnInfo(name=row[0], type=row[1]) for row in rows]
 
 
-def get_schema(parquet: Path) -> list[ColumnInfo]:
+def get_schema(parquet: str) -> list[ColumnInfo]:
     with _connect() as con:
         return _describe(con, parquet)
 
 
-def count_matches(parquet: Path, where_sql: str, params: list) -> int:
+def count_matches(parquet: str, where_sql: str, params: list) -> int:
     where_clause = f"WHERE {where_sql}" if where_sql else ""
     sql = f"SELECT count(*) FROM read_parquet({_sql_path(parquet)}) {where_clause}"
     with _connect() as con:
@@ -118,7 +133,7 @@ def count_matches(parquet: Path, where_sql: str, params: list) -> int:
 
 
 def preview(
-    parquet: Path,
+    parquet: str,
     select_sql: str,
     where_sql: str,
     order_sql: str,
@@ -141,15 +156,15 @@ def preview(
 
 
 def export_to_file(
-    parquet: Path,
+    parquet: str,
     select_sql: str,
     where_sql: str,
     order_sql: str,
     params: list,
-    dest: Path,
+    dest_path: str,
     fmt: str,
 ) -> None:
-    """Exporta el resultado filtrado a disco vía COPY (streaming, memoria constante)."""
+    """Exporta el resultado filtrado a un archivo LOCAL (dest_path) vía COPY streaming."""
     where_clause = f"WHERE {where_sql}" if where_sql else ""
     inner = (
         f"SELECT {select_sql} FROM read_parquet({_sql_path(parquet)}) "
@@ -161,13 +176,13 @@ def export_to_file(
         copy_opts = "(FORMAT xlsx, HEADER true)"
     else:
         raise ValueError(f"Formato no soportado: {fmt}")
-    sql = f"COPY ({inner}) TO {_sql_path(dest)} {copy_opts}"
+    sql = f"COPY ({inner}) TO {_sql_path(dest_path)} {copy_opts}"
     with _connect() as con:
         con.execute(sql, params)
 
 
 def distinct_values(
-    parquet: Path,
+    parquet: str,
     column_sql: str,
     search: str | None,
     limit: int,
