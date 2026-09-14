@@ -36,20 +36,30 @@ def _sql_str(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _reader_expr(source: str, extension: str, sheet: str | None = None) -> str:
+def _reader_expr(
+    source: str, extension: str, sheet: str | None = None, encoding: str | None = None
+) -> str:
     """Expresión de tabla DuckDB para leer el archivo según su extensión.
 
-    - CSV/TXT: auto-detecta delimitador, tipos y presencia de cabecera.
+    - CSV/TXT: auto-detecta delimitador, tipos y cabecera. `encoding` fuerza la
+      codificación (p. ej. 'latin-1' para archivos SUNAT no-UTF-8).
     - Excel: lee la hoja indicada (o la primera) asumiendo cabecera.
     """
     ext = extension.lower()
     literal = _sql_path(source)
     if ext in CSV_EXTENSIONS:
-        return f"read_csv_auto({literal})"
+        encoding_clause = f", encoding = {_sql_str(encoding)}" if encoding else ""
+        return f"read_csv_auto({literal}{encoding_clause})"
     if ext in EXCEL_EXTENSIONS:
         sheet_clause = f", sheet = {_sql_str(sheet)}" if sheet else ""
         return f"read_xlsx({literal}, header = true{sheet_clause})"
     raise ValueError(f"Extensión no soportada: {ext}")
+
+
+def _is_encoding_error(exc: Exception) -> bool:
+    """True si el fallo de DuckDB se debe a que el archivo no es UTF-8."""
+    message = str(exc).lower()
+    return any(hint in message for hint in ("utf-8", "unicode", "byte sequence", "encoding"))
 
 
 def list_xlsx_sheets(local_path: str) -> list[str]:
@@ -106,12 +116,26 @@ def convert_to_parquet(
     La conversión se hace vía COPY en streaming: DuckDB no carga todo en RAM.
     `sheet` solo aplica a Excel; para CSV/TXT se ignora.
     """
-    reader = _reader_expr(source, extension, sheet)
     with _connect() as con:
-        con.execute(f"COPY (SELECT * FROM {reader}) TO {_sql_path(dest)} (FORMAT PARQUET)")
+        try:
+            _copy_to_parquet(con, source, dest, extension, sheet, encoding=None)
+        except duckdb.Error as exc:
+            # Archivos SUNAT suelen venir en Latin-1/Windows-1252, no UTF-8: reintentar.
+            if extension.lower() in CSV_EXTENSIONS and _is_encoding_error(exc):
+                _copy_to_parquet(con, source, dest, extension, sheet, encoding="latin-1")
+            else:
+                raise
         columns = _describe(con, dest)
         row_count = con.execute(f"SELECT count(*) FROM read_parquet({_sql_path(dest)})").fetchone()[0]
     return columns, int(row_count)
+
+
+def _copy_to_parquet(
+    con: duckdb.DuckDBPyConnection, source: str, dest: str, extension: str,
+    sheet: str | None, encoding: str | None,
+) -> None:
+    reader = _reader_expr(source, extension, sheet, encoding)
+    con.execute(f"COPY (SELECT * FROM {reader}) TO {_sql_path(dest)} (FORMAT PARQUET)")
 
 
 def _describe(con: duckdb.DuckDBPyConnection, parquet: str) -> list[ColumnInfo]:
