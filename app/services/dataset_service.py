@@ -197,7 +197,12 @@ def preview(dataset_id: str, request: PreviewRequest, owner_id: str) -> PreviewR
     column_names, rows = duckdb_engine.preview(
         parquet, select_sql, where_sql, order_sql, request.limit, request.offset, params
     )
-    total = duckdb_engine.count_matches(parquet, where_sql, params)
+    # Sin filtro, el total es el conteo del dataset (ya en metadatos): evita un escaneo
+    # extra del Parquet en R2, que es lo caro al solo "ver" un archivo grande.
+    total = (
+        duckdb_engine.count_matches(parquet, where_sql, params)
+        if where_sql else (detail.row_count or 0)
+    )
     return PreviewResponse(
         columns=column_names,
         rows=rows,

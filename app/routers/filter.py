@@ -8,8 +8,11 @@ from app.services import dataset_service
 router = APIRouter(prefix="/datasets", tags=["filter"])
 
 
+# Endpoint SÍNCRONO a propósito: la consulta DuckDB sobre R2 es bloqueante y puede tardar
+# segundos en archivos grandes. Con `def`, FastAPI la corre en su threadpool y el servidor
+# sigue atendiendo otras peticiones (evita el "Failed to fetch" por bloqueo del event loop).
 @router.post("/{dataset_id}/preview", response_model=PreviewResponse)
-async def preview_filtered(
+def preview_filtered(
     dataset_id: str,
     request: PreviewRequest,
     user: CurrentUser = Depends(get_current_user),

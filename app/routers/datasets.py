@@ -28,7 +28,7 @@ router = APIRouter(prefix="/datasets", tags=["datasets"])
 
 @router.post("/upload-url", response_model=UploadTicket, status_code=status.HTTP_201_CREATED)
 @limiter.limit(upload_limit)
-async def create_upload_url(
+def create_upload_url(
     request: Request,
     body: UploadUrlRequest,
     user: CurrentUser = Depends(get_current_user),
@@ -48,7 +48,7 @@ async def upload_raw(
 
 
 @router.post("/{dataset_id}/uploaded", response_model=DatasetSummary, status_code=status.HTTP_202_ACCEPTED)
-async def confirm_upload(
+def confirm_upload(
     dataset_id: str,
     background_tasks: BackgroundTasks,
     user: CurrentUser = Depends(get_current_user),
@@ -60,19 +60,19 @@ async def confirm_upload(
 
 
 @router.get("", response_model=list[DatasetSummary])
-async def list_datasets(user: CurrentUser = Depends(get_current_user)) -> list[DatasetSummary]:
+def list_datasets(user: CurrentUser = Depends(get_current_user)) -> list[DatasetSummary]:
     return dataset_service.list_datasets(user.sub)
 
 
 @router.get("/{dataset_id}", response_model=DatasetDetail)
-async def get_dataset(
+def get_dataset(
     dataset_id: str, user: CurrentUser = Depends(get_current_user)
 ) -> DatasetDetail:
     return dataset_service.get_dataset(dataset_id, user.sub)
 
 
 @router.get("/{dataset_id}/values", response_model=DistinctValuesResponse)
-async def get_column_values(
+def get_column_values(
     dataset_id: str,
     column: str = Query(..., description="Nombre de la columna"),
     search: str | None = Query(None, description="Texto para filtrar los valores"),
@@ -83,7 +83,7 @@ async def get_column_values(
 
 
 @router.post("/{dataset_id}/sheet", response_model=DatasetDetail, status_code=status.HTTP_202_ACCEPTED)
-async def change_sheet(
+def change_sheet(
     dataset_id: str,
     selection: SheetSelection,
     background_tasks: BackgroundTasks,
@@ -96,7 +96,7 @@ async def change_sheet(
 
 
 @router.delete("/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_dataset(
+def delete_dataset(
     dataset_id: str, user: CurrentUser = Depends(get_current_user)
 ) -> None:
     dataset_service.delete_dataset(dataset_id, user.sub)

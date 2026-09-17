@@ -15,7 +15,7 @@ router = APIRouter(prefix="/datasets", tags=["download"])
 
 @router.post("/{dataset_id}/download")
 @limiter.limit(download_limit)
-async def download_filtered(
+def download_filtered(
     request: Request,
     dataset_id: str,
     body: DownloadRequest,
