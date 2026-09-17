@@ -57,12 +57,16 @@ def run_ingest(dataset_id: str, sheet: str | None = None) -> None:
             )
             _delete_raw(dataset_id, extension, settings)  # CSV/TXT: el crudo ya no se usa
 
+        # 0 filas = archivo vacío o solo-cabecera: inservible para filtrar (DuckDB inventa
+        # una columna fantasma en archivos vacíos, por eso el signo fiable es el nº de filas).
+        if not columns or row_count == 0:
+            raise ValueError("El archivo no contiene filas de datos. Revisa que no esté vacío.")
         repo.set_ready(dataset_id, columns, row_count)
         logger.info("Ingesta OK: dataset %s (%d filas, hoja=%s)", dataset_id, row_count,
                     sheet if is_excel else "-")
     except Exception as exc:  # noqa: BLE001 - se registra completo, al cliente va mensaje corto
         logger.exception("Fallo de ingesta para dataset %s", dataset_id)
-        repo.set_status(dataset_id, IngestStatus.FAILED, error=_short_error(exc))
+        repo.set_status(dataset_id, IngestStatus.FAILED, error=_friendly_error(exc))
     finally:
         for path in temp_files:
             if os.path.exists(path):
@@ -72,32 +76,57 @@ def run_ingest(dataset_id: str, sheet: str | None = None) -> None:
 def _ingest_csv(
     dataset_id: str, extension: str, dest_locator: str, settings, temp_files: list[str]
 ) -> tuple[list, int]:
-    """Convierte un CSV/TXT a Parquet, transcodificando a UTF-8 si DuckDB no lo lee.
+    """Convierte un CSV/TXT a Parquet, transcodificando a UTF-8 cuando hace falta.
 
-    El primer intento lee el crudo tal cual (directo desde R2, sin descargar). Solo si
-    la codificación no es soportada se descarga, se transcodifica a UTF-8 y se reintenta.
+    - UTF-16 (detectado por BOM): DuckDB lo leería como basura, así que se transcodifica
+      siempre desde el origen.
+    - Otras codificaciones: se intenta leer directo (rápido, sin descargar) y solo si
+      DuckDB no puede (Windows-1252 con rango C1) se descarga y transcodifica.
     """
-    source_locator = storage.upload_locator(dataset_id, extension)
-    try:
-        return duckdb_engine.convert_to_parquet(source_locator, dest_locator, extension)
-    except EncodingNotSupported:
-        logger.info("Codificación no-UTF-8 en dataset %s: transcodificando a UTF-8", dataset_id)
-        local_raw, temp = _local_raw_copy(dataset_id, extension, settings)
-        _track(temp_files, temp)
-        utf8_path = _transcode_to_utf8(local_raw)
-        temp_files.append(utf8_path)
-        return duckdb_engine.convert_to_parquet(utf8_path, dest_locator, extension)
+    wide_encoding = _sniff_wide_encoding(dataset_id, extension, settings)
+    if wide_encoding is None:
+        source_locator = storage.upload_locator(dataset_id, extension)
+        try:
+            return duckdb_engine.convert_to_parquet(source_locator, dest_locator, extension)
+        except EncodingNotSupported:
+            source_encoding = _FALLBACK_ENCODING
+            logger.info("Dataset %s: Windows-1252 detectado, transcodificando a UTF-8", dataset_id)
+    else:
+        source_encoding = wide_encoding
+        logger.info("Dataset %s: UTF-16 detectado, transcodificando a UTF-8", dataset_id)
+
+    local_raw, temp = _local_raw_copy(dataset_id, extension, settings)
+    _track(temp_files, temp)
+    utf8_path = _transcode_to_utf8(local_raw, source_encoding)
+    temp_files.append(utf8_path)
+    return duckdb_engine.convert_to_parquet(utf8_path, dest_locator, extension)
 
 
-def _transcode_to_utf8(source_path: str) -> str:
-    """Reescribe un CSV/TXT Windows-1252 a UTF-8 en un temporal y devuelve su ruta.
+def _sniff_wide_encoding(dataset_id: str, extension: str, settings) -> str | None:
+    """Devuelve 'utf-16' si el archivo trae BOM UTF-16 (que DuckDB leería como basura)."""
+    prefix = _read_prefix(dataset_id, extension, settings, length=2)
+    if prefix[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"  # el propio BOM indica el endianness; Python lo consume al leer
+    return None
 
-    Lectura/escritura en streaming (cp1252 es de un solo byte, sin cortes de carácter).
-    Los pocos bytes no definidos en cp1252 se reemplazan para no abortar la ingesta.
+
+def _read_prefix(dataset_id: str, extension: str, settings, length: int) -> bytes:
+    """Primeros bytes del crudo (para detectar el BOM sin descargar todo el archivo)."""
+    if settings.use_r2:
+        return r2_client.read_prefix(storage.upload_key(dataset_id, extension), length)
+    with open(storage.upload_path(dataset_id, extension), "rb") as raw:
+        return raw.read(length)
+
+
+def _transcode_to_utf8(source_path: str, source_encoding: str) -> str:
+    """Reescribe un CSV/TXT (Windows-1252 o UTF-16) a UTF-8 en un temporal.
+
+    Lectura/escritura en streaming. Los bytes no representables se reemplazan para no
+    abortar la ingesta por un carácter aislado. Para UTF-16, Python consume el BOM.
     """
     handle = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
     handle.close()
-    with open(source_path, "r", encoding=_FALLBACK_ENCODING, errors="replace", newline="") as reader, \
+    with open(source_path, "r", encoding=source_encoding, errors="replace", newline="") as reader, \
             open(handle.name, "w", encoding="utf-8", newline="") as writer:
         for chunk in iter(lambda: reader.read(_TRANSCODE_CHUNK), ""):
             writer.write(chunk)
@@ -129,7 +158,24 @@ def _delete_raw(dataset_id: str, extension: str, settings) -> None:
         storage.upload_path(dataset_id, extension).unlink(missing_ok=True)
 
 
-def _short_error(exc: Exception) -> str:
-    """Mensaje corto y sin datos sensibles para exponer al cliente."""
+def _friendly_error(exc: Exception) -> str:
+    """Traduce el fallo técnico a un mensaje accionable en español para el cliente.
+
+    Nunca expone el stack ni rutas internas; para causas conocidas da una pista de qué
+    corregir. Para lo demás, la primera línea del error (ya corta y sin datos sensibles).
+    """
+    text = str(exc).lower()
+    if any(hint in text for hint in
+           ("utf-8", "utf-16", "latin-1", "encoded", "encoding", "unicode", "byte sequence")):
+        return ("No se pudo determinar la codificación del archivo. Vuelve a guardarlo como "
+                "UTF-8 (o CSV UTF-8) e inténtalo de nuevo.")
+    if any(hint in text for hint in
+           ("delimiter", "sniffing", "columns", "expected", "csv error", "unterminated", "quote")):
+        return ("El archivo tiene filas con distinto número de columnas o un formato "
+                "inesperado. Revisa que todas las filas usen el mismo separador y número de "
+                "columnas.")
+    if any(hint in text for hint in ("xlsx", "zip", "sheet", "excel")):
+        return ("No se pudo leer el archivo Excel. Puede estar dañado, protegido con "
+                "contraseña o en un formato no compatible. Guárdalo de nuevo como .xlsx.")
     message = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
     return message[:300]

@@ -33,7 +33,9 @@ from app.schemas.filter import DistinctValuesResponse, PreviewRequest, PreviewRe
 
 _DISTINCT_VALUES_LIMIT = 500  # tope de valores en el desplegable tipo Excel
 
-_ALLOWED_EXTENSIONS = {".csv", ".txt", ".xlsx", ".xls"}
+_ALLOWED_EXTENSIONS = {".csv", ".txt", ".xlsx"}
+# .xls (Excel 97-2003, binario BIFF) no lo lee el motor (read_xlsx solo abre OOXML/.xlsx).
+_LEGACY_EXCEL_EXTENSIONS = {".xls"}
 _CHUNK_SIZE = 1024 * 1024  # 1 MB por bloque al guardar en disco (modo local)
 
 
@@ -43,6 +45,10 @@ class UnsupportedFileTypeError(Exception):
 
 class FileTooLargeError(Exception):
     """El archivo supera el tamaño máximo permitido."""
+
+
+class UploadIncompleteError(Exception):
+    """El objeto no llegó al almacenamiento (la subida del navegador no se completó)."""
 
 
 def _extension_of(filename: str) -> str:
@@ -57,6 +63,11 @@ def _extension_of(filename: str) -> str:
 def create_upload(filename: str, owner_id: str) -> UploadTicket:
     """Paso 1: valida, crea el registro PENDING y devuelve a dónde subir el archivo."""
     extension = _extension_of(filename)
+    if extension in _LEGACY_EXCEL_EXTENSIONS:
+        raise UnsupportedFileTypeError(
+            "El formato .xls (Excel antiguo) no es compatible. Ábrelo en Excel y guárdalo "
+            "como .xlsx (o .csv), luego vuelve a subirlo."
+        )
     if extension not in _ALLOWED_EXTENSIONS:
         raise UnsupportedFileTypeError(f"Tipo no permitido: {extension or 'desconocido'}")
 
@@ -99,12 +110,22 @@ async def save_raw_local(dataset_id: str, owner_id: str, request: Request) -> No
 
 
 def confirm_uploaded(dataset_id: str, owner_id: str) -> DatasetSummary:
-    """Paso 2: valida y (para R2) registra el tamaño. El router dispara la ingesta."""
+    """Paso 2: valida la subida y (para R2) registra el tamaño. El router dispara la ingesta.
+
+    En modo R2 el navegador sube directo al bucket (sin pasar por el backend), así que aquí
+    es donde se comprueba que el objeto llegó y que no excede el límite (OWASP A04).
+    """
     detail = get_dataset(dataset_id, owner_id)
-    if get_settings().use_r2:
-        size = r2_client.object_size(upload_key(dataset_id, _extension_of(detail.original_filename)))
-        if size is not None:
-            repo.set_size(dataset_id, size)
+    settings = get_settings()
+    if settings.use_r2:
+        key = upload_key(dataset_id, _extension_of(detail.original_filename))
+        size = r2_client.object_size(key)
+        if size is None:
+            raise UploadIncompleteError("La subida no se completó. Vuelve a intentarlo.")
+        if size > settings.max_upload_bytes:
+            _r2_delete_quiet(key)
+            raise FileTooLargeError(f"El archivo supera el límite de {settings.max_upload_mb} MB.")
+        repo.set_size(dataset_id, size)
     return repo.get_detail(dataset_id, owner_id)
 
 

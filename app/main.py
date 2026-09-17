@@ -24,7 +24,11 @@ from app.core.query_builder import InvalidFilterError
 from app.core.rate_limit import limiter
 from app.repositories.dataset_repository import init_db
 from app.routers import datasets, download, filter as filter_router
-from app.services.dataset_service import FileTooLargeError, UnsupportedFileTypeError
+from app.services.dataset_service import (
+    FileTooLargeError,
+    UnsupportedFileTypeError,
+    UploadIncompleteError,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -106,6 +110,10 @@ def _register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(FileTooLargeError)
     async def _file_too_large(_: Request, exc: FileTooLargeError) -> JSONResponse:
         return _json_error(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, str(exc))
+
+    @app.exception_handler(UploadIncompleteError)
+    async def _upload_incomplete(_: Request, exc: UploadIncompleteError) -> JSONResponse:
+        return _json_error(status.HTTP_400_BAD_REQUEST, str(exc))
 
 
 app = create_app()

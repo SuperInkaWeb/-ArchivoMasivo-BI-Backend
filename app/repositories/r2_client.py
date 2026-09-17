@@ -69,6 +69,22 @@ def object_size(key: str) -> int | None:
         return None
 
 
+def read_prefix(key: str, length: int) -> bytes:
+    """Primeros `length` bytes del objeto (GET con Range), para detectar el BOM.
+
+    No descarga el archivo completo. Si el objeto no existe o falla, devuelve vacío.
+    """
+    from botocore.exceptions import ClientError
+
+    try:
+        response = _client().get_object(
+            Bucket=get_settings().r2_bucket, Key=key, Range=f"bytes=0-{length - 1}"
+        )
+        return response["Body"].read()
+    except ClientError:
+        return b""
+
+
 def download_to_temp(key: str, suffix: str) -> str:
     """Descarga un objeto a un archivo temporal local y devuelve su ruta."""
     handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
