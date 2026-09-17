@@ -25,6 +25,14 @@ EXCEL_EXTENSIONS = {".xlsx", ".xls"}
 _XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
 
+class EncodingNotSupported(Exception):
+    """El archivo no es UTF-8 ni latin-1 legible por DuckDB (típico Windows-1252).
+
+    La señala la capa de datos para que el servicio lo transcodifique a UTF-8; DuckDB
+    nativo solo soporta utf-8/utf-16/latin-1 y su latin-1 rechaza el rango de control C1.
+    """
+
+
 def _sql_path(locator: str) -> str:
     """Literal SQL seguro para un locator controlado por el servidor (ruta o s3://)."""
     normalized = str(locator).replace("\\", "/").replace("'", "''")
@@ -57,9 +65,14 @@ def _reader_expr(
 
 
 def _is_encoding_error(exc: Exception) -> bool:
-    """True si el fallo de DuckDB se debe a que el archivo no es UTF-8."""
+    """True si el fallo de DuckDB se debe a la codificación del archivo.
+
+    Cubre tanto "not utf-8 encoded" como "File is not latin-1 encoded" (bytes del
+    rango de control C1 presentes en archivos Windows-1252).
+    """
     message = str(exc).lower()
-    return any(hint in message for hint in ("utf-8", "unicode", "byte sequence", "encoding"))
+    hints = ("utf-8", "unicode", "byte sequence", "encoding", "encoded")
+    return any(hint in message for hint in hints)
 
 
 def list_xlsx_sheets(local_path: str) -> list[str]:
@@ -117,17 +130,33 @@ def convert_to_parquet(
     `sheet` solo aplica a Excel; para CSV/TXT se ignora.
     """
     with _connect() as con:
-        try:
-            _copy_to_parquet(con, source, dest, extension, sheet, encoding=None)
-        except duckdb.Error as exc:
-            # Archivos SUNAT suelen venir en Latin-1/Windows-1252, no UTF-8: reintentar.
-            if extension.lower() in CSV_EXTENSIONS and _is_encoding_error(exc):
-                _copy_to_parquet(con, source, dest, extension, sheet, encoding="latin-1")
-            else:
-                raise
+        _copy_with_encoding_fallback(con, source, dest, extension, sheet)
         columns = _describe(con, dest)
         row_count = con.execute(f"SELECT count(*) FROM read_parquet({_sql_path(dest)})").fetchone()[0]
     return columns, int(row_count)
+
+
+def _copy_with_encoding_fallback(
+    con: duckdb.DuckDBPyConnection, source: str, dest: str,
+    extension: str, sheet: str | None,
+) -> None:
+    """Convierte a Parquet probando UTF-8 y, si falla por codificación, latin-1.
+
+    Archivos SUNAT suelen venir en Windows-1252, no UTF-8. Si latin-1 tampoco puede
+    (bytes del rango C1), lanza EncodingNotSupported para que el servicio transcodifique.
+    """
+    try:
+        _copy_to_parquet(con, source, dest, extension, sheet, encoding=None)
+        return
+    except duckdb.Error as exc:
+        if not (extension.lower() in CSV_EXTENSIONS and _is_encoding_error(exc)):
+            raise
+    try:
+        _copy_to_parquet(con, source, dest, extension, sheet, encoding="latin-1")
+    except duckdb.Error as exc:
+        if _is_encoding_error(exc):
+            raise EncodingNotSupported(str(exc)) from exc
+        raise
 
 
 def _copy_to_parquet(
