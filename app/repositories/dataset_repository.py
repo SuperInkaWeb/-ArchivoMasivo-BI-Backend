@@ -10,7 +10,7 @@ los datos masivos viven en Parquet. Siempre usa sentencias parametrizadas.
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.core.config import get_settings
 from app.core.storage import metadata_db_path
@@ -198,6 +198,30 @@ def get_extension(dataset_id: str) -> str | None:
         cursor.execute(f"SELECT extension FROM datasets WHERE id = {_PH}", (dataset_id,))
         row = cursor.fetchone()
     return row["extension"] if row else None
+
+
+_STALE_INGEST_MESSAGE = (
+    "La conversión se interrumpió (posible reinicio del servidor). Vuelve a subir el archivo."
+)
+
+
+def reap_stale_processing(owner_id: str, older_than_seconds: int) -> int:
+    """Marca como FAILED los datasets atascados en PROCESSING y devuelve cuántos reparó.
+
+    Detecta ingestas cuyo proceso murió (crash / redeploy a mitad): quedarían en PROCESSING
+    para siempre. Es seguro ante falsos positivos: una ingesta aún viva llamará a set_ready
+    al terminar y volverá a READY. Compara `updated_at` en ISO-8601 UTC (orden lexicográfico
+    == orden cronológico por formato uniforme).
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat()
+    with _cursor() as cursor:
+        cursor.execute(
+            f"""UPDATE datasets SET status = {_PH}, error = {_PH}, updated_at = {_PH}
+                WHERE owner_id = {_PH} AND status = {_PH} AND updated_at < {_PH}""",
+            (IngestStatus.FAILED.value, _STALE_INGEST_MESSAGE, _now(),
+             owner_id, IngestStatus.PROCESSING.value, cutoff),
+        )
+        return cursor.rowcount
 
 
 def delete(dataset_id: str, owner_id: str) -> bool:

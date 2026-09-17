@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     max_download_rows: int = 5_000_000
     preview_max_rows: int = 200
     query_timeout_seconds: int = 120
+    # Un dataset atascado en PROCESSING más de este tiempo (proceso muerto o redeploy a
+    # mitad de la conversión) se marca como FAILED al listar (auto-reparación perezosa).
+    ingest_timeout_minutes: int = 15
 
     # Autenticación (Auth0). auth_enabled=false solo para desarrollo/pruebas locales.
     auth_enabled: bool = True
@@ -72,6 +75,10 @@ class Settings(BaseSettings):
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
+
+    @property
+    def ingest_timeout_seconds(self) -> int:
+        return self.ingest_timeout_minutes * 60
 
 
 @lru_cache

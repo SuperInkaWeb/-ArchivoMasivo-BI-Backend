@@ -134,6 +134,8 @@ def confirm_uploaded(dataset_id: str, owner_id: str) -> DatasetSummary:
 # ---------------------------------------------------------------------------
 
 def list_datasets(owner_id: str) -> list[DatasetSummary]:
+    # Auto-repara ingestas colgadas (proceso muerto) aprovechando el sondeo del frontend.
+    repo.reap_stale_processing(owner_id, get_settings().ingest_timeout_seconds)
     return repo.list_all(owner_id)
 
 
