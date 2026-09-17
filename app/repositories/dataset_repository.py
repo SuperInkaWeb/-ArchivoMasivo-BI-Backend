@@ -224,6 +224,23 @@ def reap_stale_processing(owner_id: str, older_than_seconds: int) -> int:
         return cursor.rowcount
 
 
+def list_stale_pending(owner_id: str, older_than_seconds: int, limit: int = 50) -> list[str]:
+    """IDs de datasets en PENDING abandonados (URL generada, archivo nunca subido).
+
+    Usa `created_at` (un PENDING que nunca progresó no cambia de fecha). El límite acota el
+    coste por llamada; el servicio los borra reutilizando la limpieza normal de storage.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat()
+    with _cursor() as cursor:
+        cursor.execute(
+            f"""SELECT id FROM datasets
+                WHERE owner_id = {_PH} AND status = {_PH} AND created_at < {_PH}
+                ORDER BY created_at LIMIT {int(limit)}""",
+            (owner_id, IngestStatus.PENDING.value, cutoff),
+        )
+        return [row["id"] for row in cursor.fetchall()]
+
+
 def delete(dataset_id: str, owner_id: str) -> bool:
     with _cursor() as cursor:
         cursor.execute(

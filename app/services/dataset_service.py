@@ -134,9 +134,17 @@ def confirm_uploaded(dataset_id: str, owner_id: str) -> DatasetSummary:
 # ---------------------------------------------------------------------------
 
 def list_datasets(owner_id: str) -> list[DatasetSummary]:
-    # Auto-repara ingestas colgadas (proceso muerto) aprovechando el sondeo del frontend.
-    repo.reap_stale_processing(owner_id, get_settings().ingest_timeout_seconds)
+    # Mantenimiento perezoso aprovechando el sondeo del frontend:
+    settings = get_settings()
+    repo.reap_stale_processing(owner_id, settings.ingest_timeout_seconds)  # ingestas colgadas
+    _cleanup_orphan_pending(owner_id, settings)  # subidas nunca completadas
     return repo.list_all(owner_id)
+
+
+def _cleanup_orphan_pending(owner_id: str, settings) -> None:
+    """Elimina datasets en PENDING abandonados (URL generada pero archivo nunca subido)."""
+    for dataset_id in repo.list_stale_pending(owner_id, settings.pending_cleanup_seconds):
+        delete_dataset(dataset_id, owner_id)  # limpia objeto + parquet + fila (best-effort)
 
 
 def get_dataset(dataset_id: str, owner_id: str) -> DatasetDetail:

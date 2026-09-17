@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # Un dataset atascado en PROCESSING más de este tiempo (proceso muerto o redeploy a
     # mitad de la conversión) se marca como FAILED al listar (auto-reparación perezosa).
     ingest_timeout_minutes: int = 15
+    # Un dataset en PENDING (URL de subida generada pero archivo nunca subido) más de este
+    # tiempo se elimina al listar. Debe superar la expiración de la URL prefirmada.
+    pending_cleanup_minutes: int = 120
 
     # Autenticación (Auth0). auth_enabled=false solo para desarrollo/pruebas locales.
     auth_enabled: bool = True
@@ -79,6 +82,13 @@ class Settings(BaseSettings):
     @property
     def ingest_timeout_seconds(self) -> int:
         return self.ingest_timeout_minutes * 60
+
+    @property
+    def pending_cleanup_seconds(self) -> int:
+        # Nunca por debajo de (expiración de la URL prefirmada + margen): así jamás se borra
+        # una subida grande que aún podría completarse.
+        safe_minutes = max(self.pending_cleanup_minutes, self.r2_presign_expiry_minutes + 15)
+        return safe_minutes * 60
 
 
 @lru_cache

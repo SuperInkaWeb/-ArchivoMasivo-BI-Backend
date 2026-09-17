@@ -11,6 +11,7 @@ Notas de seguridad:
     se escapan/normalizan antes de inyectarse como literal SQL.
   - Los VALORES de filtro se pasan SIEMPRE como parámetros ('?') enlazados.
 """
+import logging
 import zipfile
 from xml.etree import ElementTree
 
@@ -18,6 +19,8 @@ import duckdb
 
 from app.core.config import get_settings
 from app.schemas.dataset import ColumnInfo
+
+logger = logging.getLogger(__name__)
 
 CSV_EXTENSIONS = {".csv", ".txt"}
 EXCEL_EXTENSIONS = {".xlsx", ".xls"}
@@ -45,19 +48,25 @@ def _sql_str(value: str) -> str:
 
 
 def _reader_expr(
-    source: str, extension: str, sheet: str | None = None, encoding: str | None = None
+    source: str, extension: str, sheet: str | None = None,
+    encoding: str | None = None, null_padding: bool = False,
 ) -> str:
     """Expresión de tabla DuckDB para leer el archivo según su extensión.
 
     - CSV/TXT: auto-detecta delimitador, tipos y cabecera. `encoding` fuerza la
-      codificación (p. ej. 'latin-1' para archivos SUNAT no-UTF-8).
+      codificación (p. ej. 'latin-1' para archivos SUNAT no-UTF-8). `null_padding`
+      rellena con NULL las filas con menos columnas de lo detectado (sin perder filas).
     - Excel: lee la hoja indicada (o la primera) asumiendo cabecera.
     """
     ext = extension.lower()
     literal = _sql_path(source)
     if ext in CSV_EXTENSIONS:
-        encoding_clause = f", encoding = {_sql_str(encoding)}" if encoding else ""
-        return f"read_csv_auto({literal}{encoding_clause})"
+        options = ""
+        if encoding:
+            options += f", encoding = {_sql_str(encoding)}"
+        if null_padding:
+            options += ", null_padding = true"
+        return f"read_csv_auto({literal}{options})"
     if ext in EXCEL_EXTENSIONS:
         sheet_clause = f", sheet = {_sql_str(sheet)}" if sheet else ""
         return f"read_xlsx({literal}, header = true{sheet_clause})"
@@ -130,29 +139,50 @@ def convert_to_parquet(
     `sheet` solo aplica a Excel; para CSV/TXT se ignora.
     """
     with _connect() as con:
-        _copy_with_encoding_fallback(con, source, dest, extension, sheet)
+        _copy_with_fallbacks(con, source, dest, extension, sheet)
         columns = _describe(con, dest)
         row_count = con.execute(f"SELECT count(*) FROM read_parquet({_sql_path(dest)})").fetchone()[0]
     return columns, int(row_count)
 
 
-def _copy_with_encoding_fallback(
+def _copy_with_fallbacks(
     con: duckdb.DuckDBPyConnection, source: str, dest: str,
     extension: str, sheet: str | None,
 ) -> None:
-    """Convierte a Parquet probando UTF-8 y, si falla por codificación, latin-1.
+    """Convierte a Parquet tolerando dos problemas frecuentes, en dos ejes:
 
-    Archivos SUNAT suelen venir en Windows-1252, no UTF-8. Si latin-1 tampoco puede
-    (bytes del rango C1), lanza EncodingNotSupported para que el servicio transcodifique.
+    1. Codificación: UTF-8 → latin-1; si ninguna sirve, EncodingNotSupported (el servicio
+       transcodifica Windows-1252/UTF-16 a UTF-8).
+    2. Filas irregulares: si un CSV falla por estructura, se reintenta con null_padding
+       (rellena con NULL sin perder filas). El intento estricto va primero para no
+       enmascarar problemas en archivos bien formados; no se usa ignore_errors para no
+       descartar filas en silencio.
     """
     try:
-        _copy_to_parquet(con, source, dest, extension, sheet, encoding=None)
+        _copy_trying_encodings(con, source, dest, extension, sheet, null_padding=False)
+        return
+    except duckdb.Error:
+        # EncodingNotSupported no es duckdb.Error: propaga al servicio (transcodifica).
+        # Un duckdb.Error aquí ya no es de codificación -> estructura de CSV.
+        if extension.lower() not in CSV_EXTENSIONS:
+            raise
+    logger.warning("CSV con estructura irregular en %s: reintentando con null_padding", dest)
+    _copy_trying_encodings(con, source, dest, extension, sheet, null_padding=True)
+
+
+def _copy_trying_encodings(
+    con: duckdb.DuckDBPyConnection, source: str, dest: str, extension: str,
+    sheet: str | None, null_padding: bool,
+) -> None:
+    """Copia a Parquet probando UTF-8 y, si falla por codificación, latin-1."""
+    try:
+        _copy_to_parquet(con, source, dest, extension, sheet, encoding=None, null_padding=null_padding)
         return
     except duckdb.Error as exc:
         if not (extension.lower() in CSV_EXTENSIONS and _is_encoding_error(exc)):
             raise
     try:
-        _copy_to_parquet(con, source, dest, extension, sheet, encoding="latin-1")
+        _copy_to_parquet(con, source, dest, extension, sheet, encoding="latin-1", null_padding=null_padding)
     except duckdb.Error as exc:
         if _is_encoding_error(exc):
             raise EncodingNotSupported(str(exc)) from exc
@@ -161,9 +191,9 @@ def _copy_with_encoding_fallback(
 
 def _copy_to_parquet(
     con: duckdb.DuckDBPyConnection, source: str, dest: str, extension: str,
-    sheet: str | None, encoding: str | None,
+    sheet: str | None, encoding: str | None, null_padding: bool = False,
 ) -> None:
-    reader = _reader_expr(source, extension, sheet, encoding)
+    reader = _reader_expr(source, extension, sheet, encoding, null_padding)
     con.execute(f"COPY (SELECT * FROM {reader}) TO {_sql_path(dest)} (FORMAT PARQUET)")
 
 
