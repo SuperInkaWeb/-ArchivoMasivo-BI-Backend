@@ -21,15 +21,19 @@ from app.core.storage import parquet_key, parquet_locator, parquet_path
 from app.repositories import dataset_repository as repo
 from app.repositories import duckdb_engine, r2_client
 from app.schemas.analysis import (
+    ComputeDownloadRequest,
     ComputeRequest,
     ComputeSaveRequest,
+    ComputeSpec,
+    PivotDownloadRequest,
     PivotRequest,
     PivotResponse,
     PivotSaveRequest,
+    PivotSpec,
 )
-from app.schemas.dataset import DatasetOrigin, DatasetSummary, IngestStatus
-from app.schemas.filter import PreviewResponse
-from app.services import dataset_service
+from app.schemas.dataset import DatasetDetail, DatasetOrigin, DatasetSummary, IngestStatus
+from app.schemas.filter import DownloadFormat, PreviewResponse
+from app.services import dataset_service, export_service
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +77,25 @@ def run_pivot_save(new_id: str, source_id: str, request: PivotSaveRequest, owner
     _finalize_derived(new_id, source_id, materialize)
 
 
-def _plan_pivot(dataset_id: str, request: PivotRequest, owner_id: str) -> tuple[str, str, str, list, list]:
+def export_pivot(dataset_id: str, request: PivotDownloadRequest, owner_id: str) -> export_service.ExportResult:
+    """Descarga el reporte pivote COMPLETO como archivo (CSV/XLSX/TXT), sin persistirlo."""
+    detail, valid_columns = _require_ready_columns(dataset_id, owner_id)
+    where_sql, where_params = build_where(request.filter, valid_columns)
+    pivot_values = _distinct_pivot_values(dataset_id, request, valid_columns)
+    select_sql, group_cols_sql, params = build_pivot(request, valid_columns, pivot_values)
+    parquet = parquet_locator(dataset_id)
+    matched = duckdb_engine.pivot_count(parquet, group_cols_sql, where_sql, where_params)
+    delimiter = request.delimiter.char if request.format is DownloadFormat.TXT else None
+    return export_service.write_export(
+        dataset_id, detail.original_filename, request.format, matched, "reporte",
+        lambda dest: duckdb_engine.pivot_export_to_file(
+            parquet, select_sql, group_cols_sql, where_sql,
+            params + where_params, dest, request.format.value, delimiter,
+        ),
+    )
+
+
+def _plan_pivot(dataset_id: str, request: PivotSpec, owner_id: str) -> tuple[str, str, str, list, list]:
     """Valida y arma el SQL del pivote. Devuelve (select, group_cols, where, params, where_params)."""
     _, valid_columns = _require_ready_columns(dataset_id, owner_id)
     where_sql, where_params = build_where(request.filter, valid_columns)
@@ -82,7 +104,7 @@ def _plan_pivot(dataset_id: str, request: PivotRequest, owner_id: str) -> tuple[
     return select_sql, group_cols_sql, where_sql, params, where_params
 
 
-def _distinct_pivot_values(dataset_id: str, request: PivotRequest, valid_columns: set[str]) -> list | None:
+def _distinct_pivot_values(dataset_id: str, request: PivotSpec, valid_columns: set[str]) -> list | None:
     """Valores distintos de la columna de cross-tab (o None si no hay cross-tab)."""
     if request.pivot_column is None:
         return None
@@ -138,7 +160,24 @@ def run_compute_save(new_id: str, source_id: str, request: ComputeSaveRequest, o
     _finalize_derived(new_id, source_id, materialize)
 
 
-def _compute_select(request: ComputeRequest, valid_columns: set[str]) -> tuple[str, list]:
+def export_compute(dataset_id: str, request: ComputeDownloadRequest, owner_id: str) -> export_service.ExportResult:
+    """Descarga TODAS las filas con las columnas calculadas como archivo (CSV/XLSX/TXT)."""
+    detail, valid_columns = _require_ready_columns(dataset_id, owner_id)
+    where_sql, where_params = build_where(request.filter, valid_columns)
+    select_sql, compute_params = _compute_select(request, valid_columns)
+    parquet = parquet_locator(dataset_id)
+    matched = duckdb_engine.count_matches(parquet, where_sql, where_params)
+    delimiter = request.delimiter.char if request.format is DownloadFormat.TXT else None
+    return export_service.write_export(
+        dataset_id, detail.original_filename, request.format, matched, "columnas",
+        lambda dest: duckdb_engine.export_to_file(
+            parquet, select_sql, where_sql, "", compute_params + where_params,
+            dest, request.format.value, delimiter,
+        ),
+    )
+
+
+def _compute_select(request: ComputeSpec, valid_columns: set[str]) -> tuple[str, list]:
     """Arma 'SELECT *, expr AS "alias", ...' validando nombres y expresiones."""
     pieces = ["*"]
     params: list = []
@@ -166,7 +205,7 @@ def _quote_alias(alias: str) -> str:
 # Infraestructura compartida de datasets derivados
 # ---------------------------------------------------------------------------
 
-def _require_ready_columns(dataset_id: str, owner_id: str) -> tuple[object, set[str]]:
+def _require_ready_columns(dataset_id: str, owner_id: str) -> tuple[DatasetDetail, set[str]]:
     """Devuelve (detalle, columnas_válidas) de un dataset READY del usuario."""
     detail = dataset_service.get_dataset(dataset_id, owner_id)
     if detail.status is not IngestStatus.READY:

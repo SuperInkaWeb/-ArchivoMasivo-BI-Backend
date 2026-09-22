@@ -1,16 +1,22 @@
-"""Router de análisis: tablas dinámicas (pivote).
+"""Router de análisis: tablas dinámicas (pivote) y columnas calculadas.
 
 Solo recibe la petición y delega en el service. Endpoints SÍNCRONOS a propósito:
 la consulta DuckDB es bloqueante y FastAPI la corre en su threadpool (no bloquea
 el event loop). Todos requieren autenticación y operan sobre datos del usuario.
 """
+import os
+
 from fastapi import APIRouter, BackgroundTasks, Depends, Request, status
+from starlette.background import BackgroundTask
+from starlette.responses import FileResponse
 
 from app.core.rate_limit import download_limit, limiter, upload_limit
 from app.core.security import CurrentUser, get_current_user
 from app.schemas.analysis import (
+    ComputeDownloadRequest,
     ComputeRequest,
     ComputeSaveRequest,
+    PivotDownloadRequest,
     PivotRequest,
     PivotResponse,
     PivotSaveRequest,
@@ -50,6 +56,24 @@ def pivot_save(
     return summary
 
 
+@router.post("/{dataset_id}/pivot/download")
+@limiter.limit(download_limit)
+def pivot_download(
+    request: Request,
+    dataset_id: str,
+    body: PivotDownloadRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> FileResponse:
+    """Genera el reporte pivote completo y lo transmite (CSV/XLSX/TXT)."""
+    result = analysis_service.export_pivot(dataset_id, body, user.sub)
+    return FileResponse(
+        path=result.path,
+        media_type=result.media_type,
+        filename=result.download_filename,
+        background=BackgroundTask(os.remove, result.path),
+    )
+
+
 @router.post("/{dataset_id}/compute", response_model=PreviewResponse)
 @limiter.limit(download_limit)
 def compute_view(
@@ -60,6 +84,24 @@ def compute_view(
 ) -> PreviewResponse:
     """Aplica columnas calculadas y devuelve una página (sin persistir)."""
     return analysis_service.run_compute(dataset_id, body, user.sub)
+
+
+@router.post("/{dataset_id}/compute/download")
+@limiter.limit(download_limit)
+def compute_download(
+    request: Request,
+    dataset_id: str,
+    body: ComputeDownloadRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> FileResponse:
+    """Genera todas las filas con las columnas calculadas y las transmite (CSV/XLSX/TXT)."""
+    result = analysis_service.export_compute(dataset_id, body, user.sub)
+    return FileResponse(
+        path=result.path,
+        media_type=result.media_type,
+        filename=result.download_filename,
+        background=BackgroundTask(os.remove, result.path),
+    )
 
 
 @router.post("/{dataset_id}/compute/save", response_model=DatasetSummary,

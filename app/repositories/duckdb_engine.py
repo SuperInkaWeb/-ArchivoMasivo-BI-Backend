@@ -253,6 +253,29 @@ def preview(
     return column_names, [dict(zip(column_names, row)) for row in rows]
 
 
+def _copy_options(fmt: str, delimiter: str | None) -> str:
+    """Cláusula de opciones del COPY según el formato de salida.
+
+    `delimiter` solo aplica a TXT y es un carácter de un conjunto cerrado (lo mapea
+    el servicio desde el enum Delimiter), por eso se interpola de forma segura.
+    """
+    if fmt == "csv":
+        return "(FORMAT CSV, HEADER true)"
+    if fmt == "txt":
+        # TXT = texto delimitado; DuckDB lo genera con FORMAT CSV y un DELIMITER a medida.
+        return f"(FORMAT CSV, DELIMITER {_sql_str(delimiter or chr(9))}, HEADER true)"
+    if fmt == "xlsx":
+        return "(FORMAT xlsx, HEADER true)"
+    raise ValueError(f"Formato no soportado: {fmt}")
+
+
+def _copy_query_to_file(inner_sql: str, params: list, dest_path: str, fmt: str, delimiter: str | None) -> None:
+    """Escribe el resultado de `inner_sql` a un archivo LOCAL vía COPY streaming."""
+    sql = f"COPY ({inner_sql}) TO {_sql_path(dest_path)} {_copy_options(fmt, delimiter)}"
+    with _connect() as con:
+        con.execute(sql, params)
+
+
 def export_to_file(
     parquet: str,
     select_sql: str,
@@ -263,28 +286,13 @@ def export_to_file(
     fmt: str,
     delimiter: str | None = None,
 ) -> None:
-    """Exporta el resultado filtrado a un archivo LOCAL (dest_path) vía COPY streaming.
-
-    `delimiter` solo aplica a TXT y es un carácter de un conjunto cerrado (lo mapea
-    el servicio desde el enum Delimiter), por eso se interpola de forma segura.
-    """
+    """Exporta una proyección filtrada (SELECT ... WHERE ... ORDER BY) a un archivo LOCAL."""
     where_clause = f"WHERE {where_sql}" if where_sql else ""
     inner = (
         f"SELECT {select_sql} FROM read_parquet({_sql_path(parquet)}) "
         f"{where_clause} {order_sql}"
     )
-    if fmt == "csv":
-        copy_opts = "(FORMAT CSV, HEADER true)"
-    elif fmt == "txt":
-        # TXT = texto delimitado; DuckDB lo genera con FORMAT CSV y un DELIMITER a medida.
-        copy_opts = f"(FORMAT CSV, DELIMITER {_sql_str(delimiter or chr(9))}, HEADER true)"
-    elif fmt == "xlsx":
-        copy_opts = "(FORMAT xlsx, HEADER true)"
-    else:
-        raise ValueError(f"Formato no soportado: {fmt}")
-    sql = f"COPY ({inner}) TO {_sql_path(dest_path)} {copy_opts}"
-    with _connect() as con:
-        con.execute(sql, params)
+    _copy_query_to_file(inner, params, dest_path, fmt, delimiter)
 
 
 def _pivot_body(parquet: str, select_sql: str, where_sql: str, group_cols_sql: str) -> str:
@@ -333,6 +341,15 @@ def pivot_to_parquet(
     body = _pivot_body(parquet, select_sql, where_sql, group_cols_sql)
     with _connect() as con:
         con.execute(f"COPY ({body}) TO {_sql_path(dest)} (FORMAT PARQUET)", params)
+
+
+def pivot_export_to_file(
+    parquet: str, select_sql: str, group_cols_sql: str, where_sql: str,
+    params: list, dest_path: str, fmt: str, delimiter: str | None = None,
+) -> None:
+    """Exporta el reporte pivote completo a un archivo LOCAL (CSV/TXT/XLSX) vía COPY."""
+    body = _pivot_body(parquet, select_sql, where_sql, group_cols_sql)
+    _copy_query_to_file(body, params, dest_path, fmt, delimiter)
 
 
 def materialize_to_parquet(

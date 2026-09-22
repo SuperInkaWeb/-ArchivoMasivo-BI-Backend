@@ -1,11 +1,16 @@
-"""Exportación del resultado filtrado a un archivo descargable (CSV/XLSX).
+"""Exportación de un resultado a un archivo descargable (CSV/XLSX/TXT).
 
 Escribe a un archivo temporal vía COPY (streaming en DuckDB, memoria constante),
 para luego transmitirlo. Aplica límites de recursos antes de generar nada.
+
+`write_export` centraliza el plumbing de descarga (límites, temporal, tipo MIME y
+nombre de archivo) y recibe un callback que escribe el COPY concreto. Lo reutilizan
+tanto la descarga filtrada como las de pivote / columnas calculadas (analysis_service).
 """
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from app.core.config import get_settings
 from app.core.exceptions import DatasetNotReadyError, DownloadTooLargeError
@@ -33,6 +38,29 @@ class ExportResult:
     download_filename: str
 
 
+def write_export(
+    dataset_id: str,
+    source_filename: str,
+    fmt: DownloadFormat,
+    matched: int,
+    suffix: str,
+    write: Callable[[str], None],
+) -> ExportResult:
+    """Plumbing común de descarga: valida límites, crea el temporal, escribe y nombra.
+
+    `write` recibe la ruta destino y ejecuta el COPY concreto (filtrado, pivote o
+    columnas calculadas). El temporal lo elimina el router tras transmitirlo.
+    """
+    _guard_limits(matched, fmt)
+    dest = exports_dir() / f"{dataset_id}_{uuid.uuid4().hex}.{fmt.value}"
+    write(str(dest))
+    return ExportResult(
+        path=dest,
+        media_type=_MEDIA_TYPES[fmt],
+        download_filename=f"{_sanitize_stem(source_filename)}_{suffix}.{fmt.value}",
+    )
+
+
 def build_export(dataset_id: str, request: DownloadRequest, owner_id: str) -> ExportResult:
     """Genera el archivo filtrado en disco y devuelve cómo transmitirlo."""
     detail = get_dataset(dataset_id, owner_id)
@@ -46,20 +74,12 @@ def build_export(dataset_id: str, request: DownloadRequest, owner_id: str) -> Ex
     parquet = parquet_locator(dataset_id)  # ruta local o s3://... según el modo
 
     matched = duckdb_engine.count_matches(parquet, where_sql, params)
-    _guard_limits(matched, request.format)
-
-    # El resultado filtrado se escribe SIEMPRE a un temporal local para transmitirlo.
-    dest = exports_dir() / f"{dataset_id}_{uuid.uuid4().hex}.{request.format.value}"
     delimiter = request.delimiter.char if request.format is DownloadFormat.TXT else None
-    duckdb_engine.export_to_file(
-        parquet, select_sql, where_sql, order_sql, params, str(dest), request.format.value, delimiter
-    )
-
-    base_name = _sanitize_stem(detail.original_filename)
-    return ExportResult(
-        path=dest,
-        media_type=_MEDIA_TYPES[request.format],
-        download_filename=f"{base_name}_filtrado.{request.format.value}",
+    return write_export(
+        dataset_id, detail.original_filename, request.format, matched, "filtrado",
+        lambda dest: duckdb_engine.export_to_file(
+            parquet, select_sql, where_sql, order_sql, params, dest, request.format.value, delimiter
+        ),
     )
 
 

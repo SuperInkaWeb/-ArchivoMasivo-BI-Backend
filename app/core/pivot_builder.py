@@ -10,7 +10,7 @@ Devuelve el SELECT del pivote, la lista de columnas de agrupación (para GROUP B
 ORDER BY / conteo) y los parámetros posicionales del SELECT, en orden.
 """
 from app.core.query_builder import InvalidFilterError, quote_column
-from app.schemas.analysis import Aggregation, Measure, PivotRequest
+from app.schemas.analysis import Aggregation, Measure, PivotSpec
 
 # Tope de columnas generadas por el cross-tab: evita reportes patológicos (A04).
 MAX_PIVOT_COLUMNS = 50
@@ -98,7 +98,7 @@ def _crosstab_measures_sql(
 
 
 def build_pivot(
-    request: PivotRequest, valid_columns: set[str], pivot_values: list | None,
+    request: PivotSpec, valid_columns: set[str], pivot_values: list | None,
 ) -> tuple[str, str, list]:
     """Arma el pivote. Devuelve (select_sql, group_cols_sql, select_params).
 
