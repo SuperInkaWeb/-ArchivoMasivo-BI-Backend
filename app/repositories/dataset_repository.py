@@ -14,7 +14,13 @@ from datetime import datetime, timedelta, timezone
 
 from app.core.config import get_settings
 from app.core.storage import metadata_db_path
-from app.schemas.dataset import ColumnInfo, DatasetDetail, DatasetSummary, IngestStatus
+from app.schemas.dataset import (
+    ColumnInfo,
+    DatasetDetail,
+    DatasetOrigin,
+    DatasetSummary,
+    IngestStatus,
+)
 
 _DATABASE_URL = get_settings().database_url
 IS_POSTGRES = bool(_DATABASE_URL)
@@ -51,6 +57,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     original_filename TEXT NOT NULL,
     extension         TEXT NOT NULL,
     status            TEXT NOT NULL,
+    origin            TEXT NOT NULL DEFAULT 'uploaded',
     row_count         BIGINT,
     size_bytes        BIGINT NOT NULL,
     columns_json      TEXT NOT NULL DEFAULT '[]',
@@ -92,6 +99,7 @@ def _migrate(cursor) -> None:
         cursor.execute("ALTER TABLE datasets ADD COLUMN IF NOT EXISTS sheets_json TEXT NOT NULL DEFAULT '[]'")
         cursor.execute("ALTER TABLE datasets ADD COLUMN IF NOT EXISTS active_sheet TEXT")
         cursor.execute("ALTER TABLE datasets ADD COLUMN IF NOT EXISTS owner_id TEXT")
+        cursor.execute("ALTER TABLE datasets ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'uploaded'")
         return
     existing = {row["name"] for row in cursor.execute("PRAGMA table_info(datasets)").fetchall()}
     if "sheets_json" not in existing:
@@ -100,6 +108,8 @@ def _migrate(cursor) -> None:
         cursor.execute("ALTER TABLE datasets ADD COLUMN active_sheet TEXT")
     if "owner_id" not in existing:
         cursor.execute("ALTER TABLE datasets ADD COLUMN owner_id TEXT")
+    if "origin" not in existing:
+        cursor.execute("ALTER TABLE datasets ADD COLUMN origin TEXT NOT NULL DEFAULT 'uploaded'")
 
 
 def _now() -> str:
@@ -107,15 +117,17 @@ def _now() -> str:
 
 
 def create(
-    dataset_id: str, owner_id: str, original_filename: str, extension: str, size_bytes: int
+    dataset_id: str, owner_id: str, original_filename: str, extension: str, size_bytes: int,
+    origin: DatasetOrigin = DatasetOrigin.UPLOADED,
 ) -> None:
     now = _now()
     with _cursor() as cursor:
         cursor.execute(
             f"""INSERT INTO datasets
-                (id, owner_id, original_filename, extension, status, size_bytes, columns_json, created_at, updated_at)
-                VALUES ({_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, '[]', {_PH}, {_PH})""",
-            (dataset_id, owner_id, original_filename, extension, IngestStatus.PENDING.value, size_bytes, now, now),
+                (id, owner_id, original_filename, extension, status, origin, size_bytes, columns_json, created_at, updated_at)
+                VALUES ({_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, '[]', {_PH}, {_PH})""",
+            (dataset_id, owner_id, original_filename, extension, IngestStatus.PENDING.value,
+             origin.value, size_bytes, now, now),
         )
 
 
@@ -159,6 +171,7 @@ def _row_to_summary(row) -> DatasetSummary:
         id=row["id"],
         original_filename=row["original_filename"],
         status=IngestStatus(row["status"]),
+        origin=DatasetOrigin(row["origin"] or DatasetOrigin.UPLOADED.value),
         row_count=row["row_count"],
         size_bytes=row["size_bytes"],
         created_at=datetime.fromisoformat(row["created_at"]),

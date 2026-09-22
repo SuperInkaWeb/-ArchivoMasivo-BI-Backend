@@ -12,6 +12,12 @@ class IngestStatus(str, Enum):
     FAILED = "failed"        # error de ingesta
 
 
+class DatasetOrigin(str, Enum):
+    """Cómo se creó el dataset (separa las dos pestañas del frontend)."""
+    UPLOADED = "uploaded"  # subido por el usuario
+    PIVOT = "pivot"        # generado por una tabla dinámica (reporte)
+
+
 class ColumnInfo(BaseModel):
     name: str
     type: str  # tipo DuckDB (VARCHAR, BIGINT, DOUBLE, DATE, ...)
@@ -22,6 +28,7 @@ class DatasetSummary(BaseModel):
     id: str
     original_filename: str
     status: IngestStatus
+    origin: DatasetOrigin = DatasetOrigin.UPLOADED
     row_count: int | None = None
     size_bytes: int
     created_at: datetime

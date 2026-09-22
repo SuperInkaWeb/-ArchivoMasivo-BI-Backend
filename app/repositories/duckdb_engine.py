@@ -287,6 +287,54 @@ def export_to_file(
         con.execute(sql, params)
 
 
+def _pivot_body(parquet: str, select_sql: str, where_sql: str, group_cols_sql: str) -> str:
+    """SELECT completo del pivote (proyección + WHERE + GROUP BY + ORDER BY)."""
+    where_clause = f"WHERE {where_sql}" if where_sql else ""
+    return (
+        f"SELECT {select_sql} FROM read_parquet({_sql_path(parquet)}) "
+        f"{where_clause} GROUP BY {group_cols_sql} ORDER BY {group_cols_sql}"
+    )
+
+
+def pivot_preview(
+    parquet: str, select_sql: str, group_cols_sql: str, where_sql: str,
+    params: list, limit: int, offset: int,
+) -> tuple[list[str], list[dict]]:
+    """Una página del reporte pivote. `params` = params del SELECT + params del WHERE."""
+    body = _pivot_body(parquet, select_sql, where_sql, group_cols_sql)
+    sql = f"SELECT * FROM ({body}) LIMIT {int(limit)} OFFSET {int(offset)}"
+    with _connect() as con:
+        cursor = con.execute(sql, params)
+        column_names = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+    return column_names, [dict(zip(column_names, row)) for row in rows]
+
+
+def pivot_count(parquet: str, group_cols_sql: str, where_sql: str, where_params: list) -> int:
+    """Nº de filas agrupadas del reporte completo (para paginación).
+
+    Cuenta solo por las columnas de agrupación: no necesita los parámetros del cross-tab,
+    lo que lo hace más barato que envolver el pivote completo.
+    """
+    where_clause = f"WHERE {where_sql}" if where_sql else ""
+    inner = (
+        f"SELECT {group_cols_sql} FROM read_parquet({_sql_path(parquet)}) "
+        f"{where_clause} GROUP BY {group_cols_sql}"
+    )
+    with _connect() as con:
+        return int(con.execute(f"SELECT count(*) FROM ({inner})", where_params).fetchone()[0])
+
+
+def pivot_to_parquet(
+    parquet: str, select_sql: str, group_cols_sql: str, where_sql: str,
+    params: list, dest: str,
+) -> None:
+    """Materializa el reporte pivote a un Parquet nuevo (para 'guardar como archivo')."""
+    body = _pivot_body(parquet, select_sql, where_sql, group_cols_sql)
+    with _connect() as con:
+        con.execute(f"COPY ({body}) TO {_sql_path(dest)} (FORMAT PARQUET)", params)
+
+
 def distinct_values(
     parquet: str,
     column_sql: str,
