@@ -22,6 +22,7 @@ _XLSX_MAX_DATA_ROWS = 1_048_575
 _MEDIA_TYPES = {
     DownloadFormat.CSV: "text/csv",
     DownloadFormat.XLSX: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    DownloadFormat.TXT: "text/plain; charset=utf-8",
 }
 
 
@@ -49,8 +50,9 @@ def build_export(dataset_id: str, request: DownloadRequest, owner_id: str) -> Ex
 
     # El resultado filtrado se escribe SIEMPRE a un temporal local para transmitirlo.
     dest = exports_dir() / f"{dataset_id}_{uuid.uuid4().hex}.{request.format.value}"
+    delimiter = request.delimiter.char if request.format is DownloadFormat.TXT else None
     duckdb_engine.export_to_file(
-        parquet, select_sql, where_sql, order_sql, params, str(dest), request.format.value
+        parquet, select_sql, where_sql, order_sql, params, str(dest), request.format.value, delimiter
     )
 
     base_name = _sanitize_stem(detail.original_filename)

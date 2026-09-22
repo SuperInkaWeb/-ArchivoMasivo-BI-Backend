@@ -95,10 +95,34 @@ class PreviewResponse(BaseModel):
 class DownloadFormat(str, Enum):
     CSV = "csv"
     XLSX = "xlsx"
+    TXT = "txt"
+
+
+class Delimiter(str, Enum):
+    """Separadores permitidos para la descarga en TXT (conjunto CERRADO).
+
+    Solo aplica al formato TXT. El carácter real (`.char`) lo usa el motor al
+    construir el COPY; al provenir de un enum cerrado, jamás es texto arbitrario.
+    """
+    TAB = "tab"
+    PIPE = "pipe"
+    SEMICOLON = "semicolon"
+    COMMA = "comma"
+
+    @property
+    def char(self) -> str:
+        return {
+            Delimiter.TAB: "\t",
+            Delimiter.PIPE: "|",
+            Delimiter.SEMICOLON: ";",
+            Delimiter.COMMA: ",",
+        }[self]
 
 
 class DownloadRequest(FilterRequest):
     format: DownloadFormat = DownloadFormat.CSV
+    # Separador para TXT; se ignora en CSV/XLSX.
+    delimiter: Delimiter = Delimiter.TAB
 
 
 class DistinctValuesResponse(BaseModel):

@@ -261,8 +261,13 @@ def export_to_file(
     params: list,
     dest_path: str,
     fmt: str,
+    delimiter: str | None = None,
 ) -> None:
-    """Exporta el resultado filtrado a un archivo LOCAL (dest_path) vía COPY streaming."""
+    """Exporta el resultado filtrado a un archivo LOCAL (dest_path) vía COPY streaming.
+
+    `delimiter` solo aplica a TXT y es un carácter de un conjunto cerrado (lo mapea
+    el servicio desde el enum Delimiter), por eso se interpola de forma segura.
+    """
     where_clause = f"WHERE {where_sql}" if where_sql else ""
     inner = (
         f"SELECT {select_sql} FROM read_parquet({_sql_path(parquet)}) "
@@ -270,6 +275,9 @@ def export_to_file(
     )
     if fmt == "csv":
         copy_opts = "(FORMAT CSV, HEADER true)"
+    elif fmt == "txt":
+        # TXT = texto delimitado; DuckDB lo genera con FORMAT CSV y un DELIMITER a medida.
+        copy_opts = f"(FORMAT CSV, DELIMITER {_sql_str(delimiter or chr(9))}, HEADER true)"
     elif fmt == "xlsx":
         copy_opts = "(FORMAT xlsx, HEADER true)"
     else:
