@@ -335,6 +335,16 @@ def pivot_to_parquet(
         con.execute(f"COPY ({body}) TO {_sql_path(dest)} (FORMAT PARQUET)", params)
 
 
+def materialize_to_parquet(
+    parquet: str, select_sql: str, where_sql: str, params: list, dest: str,
+) -> None:
+    """Materializa una proyección (p. ej. con columnas calculadas) a un Parquet nuevo."""
+    where_clause = f"WHERE {where_sql}" if where_sql else ""
+    body = f"SELECT {select_sql} FROM read_parquet({_sql_path(parquet)}) {where_clause}"
+    with _connect() as con:
+        con.execute(f"COPY ({body}) TO {_sql_path(dest)} (FORMAT PARQUET)", params)
+
+
 def distinct_values(
     parquet: str,
     column_sql: str,

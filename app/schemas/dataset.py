@@ -13,9 +13,10 @@ class IngestStatus(str, Enum):
 
 
 class DatasetOrigin(str, Enum):
-    """Cómo se creó el dataset (separa las dos pestañas del frontend)."""
+    """Cómo se creó el dataset (separa las pestañas del frontend)."""
     UPLOADED = "uploaded"  # subido por el usuario
     PIVOT = "pivot"        # generado por una tabla dinámica (reporte)
+    COMPUTED = "computed"  # generado al añadir columnas calculadas
 
 
 class ColumnInfo(BaseModel):

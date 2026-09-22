@@ -1,36 +1,49 @@
-"""Orquestación de tablas dinámicas (pivote): ver y guardar como dataset.
+"""Orquestación de análisis: tablas dinámicas (pivote) y columnas calculadas.
 
-- Ver: ejecuta el pivote y devuelve una página del reporte (paginado).
-- Guardar: materializa el reporte a un Parquet nuevo y lo registra como un dataset
-  derivado (origin=pivot). Se hace en segundo plano reutilizando la misma máquina de
-  estados PROCESSING->READY y el sondeo del frontend (igual que la ingesta normal).
+Ambas ofrecen "ver" (paginado, sin persistir) y "guardar como dataset nuevo". El
+guardado materializa el resultado a un Parquet y registra un dataset derivado
+(origin=pivot|computed) en segundo plano, reutilizando la máquina de estados
+PROCESSING->READY y el sondeo del frontend (igual que la ingesta normal).
 
-Un reporte guardado es un dataset como cualquiera: se puede filtrar, previsualizar y
-descargar (CSV/TXT/XLSX) con los endpoints existentes.
+Un dataset derivado es uno más: se puede filtrar, previsualizar y descargar
+(CSV/TXT/XLSX) con los endpoints existentes.
 """
 import logging
 import uuid
+from typing import Callable
 
 from app.core.config import get_settings
 from app.core.exceptions import DatasetNotReadyError
+from app.core.expression_builder import build_expression
 from app.core.pivot_builder import MAX_PIVOT_COLUMNS, build_pivot
 from app.core.query_builder import InvalidFilterError, build_where, quote_column
 from app.core.storage import parquet_key, parquet_locator, parquet_path
 from app.repositories import dataset_repository as repo
 from app.repositories import duckdb_engine, r2_client
-from app.schemas.analysis import PivotRequest, PivotResponse, PivotSaveRequest
+from app.schemas.analysis import (
+    ComputeRequest,
+    ComputeSaveRequest,
+    PivotRequest,
+    PivotResponse,
+    PivotSaveRequest,
+)
 from app.schemas.dataset import DatasetOrigin, DatasetSummary, IngestStatus
+from app.schemas.filter import PreviewResponse
 from app.services import dataset_service
 
 logger = logging.getLogger(__name__)
 
-# Extensión lógica de un reporte: sus datos ya viven en Parquet (no hay archivo crudo).
-_PIVOT_EXTENSION = ".parquet"
+# Extensión lógica de un dataset derivado: sus datos ya viven en Parquet (sin crudo).
+_DERIVED_EXTENSION = ".parquet"
 
+
+# ---------------------------------------------------------------------------
+# Tablas dinámicas (pivote)
+# ---------------------------------------------------------------------------
 
 def run_pivot(dataset_id: str, request: PivotRequest, owner_id: str) -> PivotResponse:
     """Ejecuta el pivote y devuelve una página del reporte + total de filas agrupadas."""
-    select_sql, group_cols_sql, where_sql, params, where_params = _plan(dataset_id, request, owner_id)
+    select_sql, group_cols_sql, where_sql, params, where_params = _plan_pivot(dataset_id, request, owner_id)
     parquet = parquet_locator(dataset_id)
     total = duckdb_engine.pivot_count(parquet, group_cols_sql, where_sql, where_params)
     columns, rows = duckdb_engine.pivot_preview(
@@ -46,41 +59,23 @@ def run_pivot(dataset_id: str, request: PivotRequest, owner_id: str) -> PivotRes
 def start_pivot_save(dataset_id: str, request: PivotSaveRequest, owner_id: str) -> DatasetSummary:
     """Crea el registro del reporte en PROCESSING y lo devuelve. El router lanza la tarea."""
     dataset_service.get_dataset(dataset_id, owner_id)  # valida propiedad/existencia del origen
-    new_id = uuid.uuid4().hex
-    repo.create(new_id, owner_id, request.name.strip(), _PIVOT_EXTENSION, size_bytes=0,
-                origin=DatasetOrigin.PIVOT)
-    repo.set_status(new_id, IngestStatus.PROCESSING)
-    return repo.get_detail(new_id, owner_id)
+    return _start_derived(owner_id, request.name.strip(), DatasetOrigin.PIVOT)
 
 
 def run_pivot_save(new_id: str, source_id: str, request: PivotSaveRequest, owner_id: str) -> None:
-    """Tarea en segundo plano: materializa el reporte a Parquet y marca READY/FAILED."""
-    try:
-        select_sql, group_cols_sql, where_sql, params, where_params = _plan(source_id, request, owner_id)
-        dest = parquet_locator(new_id)
+    """Tarea en segundo plano: materializa el pivote a Parquet y marca READY/FAILED."""
+    def materialize() -> None:
+        select_sql, group_cols_sql, where_sql, params, where_params = _plan_pivot(source_id, request, owner_id)
         duckdb_engine.pivot_to_parquet(
             parquet_locator(source_id), select_sql, group_cols_sql, where_sql,
-            params + where_params, dest,
+            params + where_params, parquet_locator(new_id),
         )
-        columns = duckdb_engine.get_schema(dest)
-        row_count = duckdb_engine.count_matches(dest, "", [])
-        if not columns or row_count == 0:
-            raise ValueError("El pivote no generó ninguna fila.")
-        repo.set_ready(new_id, columns, row_count)
-        repo.set_size(new_id, _parquet_size(new_id))
-        logger.info("Pivote guardado: %s (%d filas) desde %s", new_id, row_count, source_id)
-    except Exception as exc:  # noqa: BLE001 - stack al log, mensaje corto al cliente
-        logger.exception("Fallo al guardar el pivote %s desde %s", new_id, source_id)
-        repo.set_status(new_id, IngestStatus.FAILED, error=_friendly_error(exc))
+    _finalize_derived(new_id, source_id, materialize)
 
 
-def _plan(dataset_id: str, request: PivotRequest, owner_id: str) -> tuple[str, str, str, list, list]:
+def _plan_pivot(dataset_id: str, request: PivotRequest, owner_id: str) -> tuple[str, str, str, list, list]:
     """Valida y arma el SQL del pivote. Devuelve (select, group_cols, where, params, where_params)."""
-    detail = dataset_service.get_dataset(dataset_id, owner_id)
-    if detail.status is not IngestStatus.READY:
-        raise DatasetNotReadyError(f"El dataset está en estado '{detail.status.value}'.")
-    valid_columns = {col.name for col in detail.columns}
-
+    _, valid_columns = _require_ready_columns(dataset_id, owner_id)
     where_sql, where_params = build_where(request.filter, valid_columns)
     pivot_values = _distinct_pivot_values(dataset_id, request, valid_columns)
     select_sql, group_cols_sql, params = build_pivot(request, valid_columns, pivot_values)
@@ -103,6 +98,106 @@ def _distinct_pivot_values(dataset_id: str, request: PivotRequest, valid_columns
     return values
 
 
+# ---------------------------------------------------------------------------
+# Columnas calculadas
+# ---------------------------------------------------------------------------
+
+def run_compute(dataset_id: str, request: ComputeRequest, owner_id: str) -> PreviewResponse:
+    """Aplica las columnas calculadas y devuelve una página (todas las originales + nuevas)."""
+    _, valid_columns = _require_ready_columns(dataset_id, owner_id)
+    where_sql, where_params = build_where(request.filter, valid_columns)
+    select_sql, compute_params = _compute_select(request, valid_columns)
+    parquet = parquet_locator(dataset_id)
+    total = duckdb_engine.count_matches(parquet, where_sql, where_params)
+    columns, rows = duckdb_engine.preview(
+        parquet, select_sql, where_sql, "", request.limit, request.offset,
+        compute_params + where_params,
+    )
+    return PreviewResponse(
+        columns=columns, rows=rows, total_matched=total,
+        limit=request.limit, offset=request.offset,
+    )
+
+
+def start_compute_save(dataset_id: str, request: ComputeSaveRequest, owner_id: str) -> DatasetSummary:
+    """Crea el registro del dataset con columnas calculadas en PROCESSING y lo devuelve."""
+    dataset_service.get_dataset(dataset_id, owner_id)
+    return _start_derived(owner_id, request.name.strip(), DatasetOrigin.COMPUTED)
+
+
+def run_compute_save(new_id: str, source_id: str, request: ComputeSaveRequest, owner_id: str) -> None:
+    """Tarea en segundo plano: materializa las columnas calculadas y marca READY/FAILED."""
+    def materialize() -> None:
+        _, valid_columns = _require_ready_columns(source_id, owner_id)
+        where_sql, where_params = build_where(request.filter, valid_columns)
+        select_sql, compute_params = _compute_select(request, valid_columns)
+        duckdb_engine.materialize_to_parquet(
+            parquet_locator(source_id), select_sql, where_sql,
+            compute_params + where_params, parquet_locator(new_id),
+        )
+    _finalize_derived(new_id, source_id, materialize)
+
+
+def _compute_select(request: ComputeRequest, valid_columns: set[str]) -> tuple[str, list]:
+    """Arma 'SELECT *, expr AS "alias", ...' validando nombres y expresiones."""
+    pieces = ["*"]
+    params: list = []
+    seen: set[str] = set()
+    for column in request.columns:
+        alias = column.name.strip()
+        if not alias:
+            raise InvalidFilterError("El nombre de la columna calculada no puede estar vacío.")
+        if alias in valid_columns:
+            raise InvalidFilterError(f"Ya existe una columna llamada '{alias}'.")
+        if alias in seen:
+            raise InvalidFilterError(f"Nombre de columna calculada repetido: '{alias}'.")
+        seen.add(alias)
+        expr_sql, expr_params = build_expression(column.expression, valid_columns)
+        pieces.append(f'{expr_sql} AS {_quote_alias(alias)}')
+        params.extend(expr_params)
+    return ", ".join(pieces), params
+
+
+def _quote_alias(alias: str) -> str:
+    return '"' + alias.replace('"', '""') + '"'
+
+
+# ---------------------------------------------------------------------------
+# Infraestructura compartida de datasets derivados
+# ---------------------------------------------------------------------------
+
+def _require_ready_columns(dataset_id: str, owner_id: str) -> tuple[object, set[str]]:
+    """Devuelve (detalle, columnas_válidas) de un dataset READY del usuario."""
+    detail = dataset_service.get_dataset(dataset_id, owner_id)
+    if detail.status is not IngestStatus.READY:
+        raise DatasetNotReadyError(f"El dataset está en estado '{detail.status.value}'.")
+    return detail, {col.name for col in detail.columns}
+
+
+def _start_derived(owner_id: str, name: str, origin: DatasetOrigin) -> DatasetSummary:
+    new_id = uuid.uuid4().hex
+    repo.create(new_id, owner_id, name, _DERIVED_EXTENSION, size_bytes=0, origin=origin)
+    repo.set_status(new_id, IngestStatus.PROCESSING)
+    return repo.get_detail(new_id, owner_id)
+
+
+def _finalize_derived(new_id: str, source_id: str, materialize: Callable[[], None]) -> None:
+    """Ejecuta la materialización y marca READY/FAILED (patrón común pivote/compute)."""
+    try:
+        materialize()
+        dest = parquet_locator(new_id)
+        columns = duckdb_engine.get_schema(dest)
+        row_count = duckdb_engine.count_matches(dest, "", [])
+        if not columns or row_count == 0:
+            raise ValueError("No se generó ninguna fila.")
+        repo.set_ready(new_id, columns, row_count)
+        repo.set_size(new_id, _parquet_size(new_id))
+        logger.info("Dataset derivado %s listo (%d filas) desde %s", new_id, row_count, source_id)
+    except Exception as exc:  # noqa: BLE001 - stack al log, mensaje corto al cliente
+        logger.exception("Fallo al generar el dataset derivado %s desde %s", new_id, source_id)
+        repo.set_status(new_id, IngestStatus.FAILED, error=_friendly_error(exc))
+
+
 def _parquet_size(dataset_id: str) -> int:
     """Tamaño del Parquet generado (best-effort; 0 si no se puede medir)."""
     try:
@@ -114,7 +209,7 @@ def _parquet_size(dataset_id: str) -> int:
 
 
 def _friendly_error(exc: Exception) -> str:
-    """Mensaje corto y sin internals para el cliente ante un fallo del pivote."""
+    """Mensaje corto y sin internals para el cliente ante un fallo."""
     if isinstance(exc, (InvalidFilterError, DatasetNotReadyError)):
         return str(exc)
     text = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__

@@ -12,6 +12,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from app.schemas.expression import ComputedColumn
 from app.schemas.filter import FilterGroup
 
 
@@ -55,4 +56,17 @@ class PivotResponse(BaseModel):
 
 class PivotSaveRequest(PivotRequest):
     """Pivote que se persiste como un dataset nuevo (reporte reutilizable)."""
+    name: str = Field(min_length=1, max_length=120)
+
+
+class ComputeRequest(BaseModel):
+    """Configuración de columnas calculadas para VER (paginado)."""
+    filter: FilterGroup | None = None
+    columns: list[ComputedColumn] = Field(min_length=1, max_length=20)
+    limit: int = Field(default=100, ge=1, le=1000)
+    offset: int = Field(default=0, ge=0)
+
+
+class ComputeSaveRequest(ComputeRequest):
+    """Columnas calculadas que se persisten como un dataset nuevo."""
     name: str = Field(min_length=1, max_length=120)
