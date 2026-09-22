@@ -20,6 +20,9 @@ from app.schemas.analysis import (
     PivotRequest,
     PivotResponse,
     PivotSaveRequest,
+    ReplaceDownloadRequest,
+    ReplaceRequest,
+    ReplaceSaveRequest,
 )
 from app.schemas.dataset import DatasetSummary
 from app.schemas.filter import PreviewResponse
@@ -117,4 +120,50 @@ def compute_save(
     """Guarda las columnas calculadas como un dataset nuevo (se materializa en segundo plano)."""
     summary = analysis_service.start_compute_save(dataset_id, body, user.sub)
     background_tasks.add_task(analysis_service.run_compute_save, summary.id, dataset_id, body, user.sub)
+    return summary
+
+
+@router.post("/{dataset_id}/replace", response_model=PreviewResponse)
+@limiter.limit(download_limit)
+def replace_view(
+    request: Request,
+    dataset_id: str,
+    body: ReplaceRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> PreviewResponse:
+    """Aplica el buscar-y-reemplazar y devuelve una página corregida (sin persistir)."""
+    return analysis_service.run_replace(dataset_id, body, user.sub)
+
+
+@router.post("/{dataset_id}/replace/download")
+@limiter.limit(download_limit)
+def replace_download(
+    request: Request,
+    dataset_id: str,
+    body: ReplaceDownloadRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> FileResponse:
+    """Genera todas las filas ya corregidas y las transmite (CSV/XLSX/TXT)."""
+    result = analysis_service.export_replace(dataset_id, body, user.sub)
+    return FileResponse(
+        path=result.path,
+        media_type=result.media_type,
+        filename=result.download_filename,
+        background=BackgroundTask(os.remove, result.path),
+    )
+
+
+@router.post("/{dataset_id}/replace/save", response_model=DatasetSummary,
+             status_code=status.HTTP_202_ACCEPTED)
+@limiter.limit(upload_limit)
+def replace_save(
+    request: Request,
+    dataset_id: str,
+    body: ReplaceSaveRequest,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(get_current_user),
+) -> DatasetSummary:
+    """Guarda las correcciones como un dataset nuevo (se materializa en segundo plano)."""
+    summary = analysis_service.start_replace_save(dataset_id, body, user.sub)
+    background_tasks.add_task(analysis_service.run_replace_save, summary.id, dataset_id, body, user.sub)
     return summary

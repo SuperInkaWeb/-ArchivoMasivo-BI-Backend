@@ -17,6 +17,7 @@ from app.core.exceptions import DatasetNotReadyError
 from app.core.expression_builder import build_expression
 from app.core.pivot_builder import MAX_PIVOT_COLUMNS, build_pivot
 from app.core.query_builder import InvalidFilterError, build_where, quote_column
+from app.core.replace_builder import build_replace_select
 from app.core.storage import parquet_key, parquet_locator, parquet_path
 from app.repositories import dataset_repository as repo
 from app.repositories import duckdb_engine, r2_client
@@ -30,6 +31,10 @@ from app.schemas.analysis import (
     PivotResponse,
     PivotSaveRequest,
     PivotSpec,
+    ReplaceDownloadRequest,
+    ReplaceRequest,
+    ReplaceSaveRequest,
+    ReplaceSpec,
 )
 from app.schemas.dataset import DatasetDetail, DatasetOrigin, DatasetSummary, IngestStatus
 from app.schemas.filter import DownloadFormat, PreviewResponse
@@ -199,6 +204,66 @@ def _compute_select(request: ComputeSpec, valid_columns: set[str]) -> tuple[str,
 
 def _quote_alias(alias: str) -> str:
     return '"' + alias.replace('"', '""') + '"'
+
+
+# ---------------------------------------------------------------------------
+# Buscar y reemplazar por columna
+# ---------------------------------------------------------------------------
+
+def run_replace(dataset_id: str, request: ReplaceRequest, owner_id: str) -> PreviewResponse:
+    """Aplica las correcciones y devuelve una página (todas las columnas, ya corregidas)."""
+    select_sql, where_sql, params, where_params = _plan_replace(dataset_id, request, owner_id)
+    parquet = parquet_locator(dataset_id)
+    total = duckdb_engine.count_matches(parquet, where_sql, where_params)
+    columns, rows = duckdb_engine.preview(
+        parquet, select_sql, where_sql, "", request.limit, request.offset, params + where_params,
+    )
+    return PreviewResponse(
+        columns=columns, rows=rows, total_matched=total,
+        limit=request.limit, offset=request.offset,
+    )
+
+
+def start_replace_save(dataset_id: str, request: ReplaceSaveRequest, owner_id: str) -> DatasetSummary:
+    """Crea el registro del dataset corregido en PROCESSING y lo devuelve."""
+    dataset_service.get_dataset(dataset_id, owner_id)
+    return _start_derived(owner_id, request.name.strip(), DatasetOrigin.REPLACED)
+
+
+def run_replace_save(new_id: str, source_id: str, request: ReplaceSaveRequest, owner_id: str) -> None:
+    """Tarea en segundo plano: materializa las correcciones y marca READY/FAILED."""
+    def materialize() -> None:
+        select_sql, where_sql, params, where_params = _plan_replace(source_id, request, owner_id)
+        duckdb_engine.materialize_to_parquet(
+            parquet_locator(source_id), select_sql, where_sql,
+            params + where_params, parquet_locator(new_id),
+        )
+    _finalize_derived(new_id, source_id, materialize)
+
+
+def export_replace(dataset_id: str, request: ReplaceDownloadRequest, owner_id: str) -> export_service.ExportResult:
+    """Descarga TODAS las filas ya corregidas como archivo (CSV/XLSX/TXT)."""
+    detail, _ = _require_ready_columns(dataset_id, owner_id)
+    select_sql, where_sql, params, where_params = _plan_replace(dataset_id, request, owner_id)
+    parquet = parquet_locator(dataset_id)
+    matched = duckdb_engine.count_matches(parquet, where_sql, where_params)
+    delimiter = request.delimiter.char if request.format is DownloadFormat.TXT else None
+    return export_service.write_export(
+        dataset_id, detail.original_filename, request.format, matched, "corregido",
+        lambda dest: duckdb_engine.export_to_file(
+            parquet, select_sql, where_sql, "", params + where_params,
+            dest, request.format.value, delimiter,
+        ),
+    )
+
+
+def _plan_replace(dataset_id: str, request: ReplaceSpec, owner_id: str) -> tuple[str, str, list, list]:
+    """Valida y arma el SQL de corrección. Devuelve (select, where, params, where_params)."""
+    detail, valid_columns = _require_ready_columns(dataset_id, owner_id)
+    where_sql, where_params = build_where(request.filter, valid_columns)
+    column_order = [column.name for column in detail.columns]
+    select_sql, params = build_replace_select(request.replacements, column_order, valid_columns)
+    return select_sql, where_sql, params, where_params
 
 
 # ---------------------------------------------------------------------------

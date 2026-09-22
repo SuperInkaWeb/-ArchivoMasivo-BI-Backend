@@ -94,3 +94,49 @@ class ComputeDownloadRequest(ComputeSpec):
     """Columnas calculadas que se descargan como archivo (CSV/XLSX/TXT)."""
     format: DownloadFormat = DownloadFormat.CSV
     delimiter: Delimiter = Delimiter.TAB  # solo aplica a TXT
+
+
+class MatchMode(str, Enum):
+    """Cómo se compara el texto a buscar (conjunto CERRADO).
+
+    EXACT    -> reemplaza solo cuando el valor de la celda es idéntico.
+    CONTAINS -> reemplaza cada aparición del texto dentro del valor.
+    """
+    EXACT = "exact"
+    CONTAINS = "contains"
+
+
+class ReplacementRule(BaseModel):
+    """Una corrección: en `column`, cambiar `search` por `replace`.
+
+    `case_sensitive` solo aplica al modo EXACT; CONTAINS distingue mayúsculas
+    siempre (se documenta en la UI).
+    """
+    column: str
+    mode: MatchMode = MatchMode.EXACT
+    search: str = Field(min_length=1, max_length=500)
+    replace: str = Field(default="", max_length=500)  # vacío = eliminar el texto
+    case_sensitive: bool = True
+
+
+class ReplaceSpec(BaseModel):
+    """Definición de un buscar-y-reemplazar por columna (sin paginación ni destino)."""
+    filter: FilterGroup | None = None
+    replacements: list[ReplacementRule] = Field(min_length=1, max_length=20)
+
+
+class ReplaceRequest(ReplaceSpec):
+    """Buscar y reemplazar para VER (una página, con las correcciones aplicadas)."""
+    limit: int = Field(default=100, ge=1, le=1000)
+    offset: int = Field(default=0, ge=0)
+
+
+class ReplaceSaveRequest(ReplaceSpec):
+    """Correcciones que se persisten como un dataset nuevo."""
+    name: str = Field(min_length=1, max_length=120)
+
+
+class ReplaceDownloadRequest(ReplaceSpec):
+    """Correcciones que se descargan como archivo (CSV/XLSX/TXT)."""
+    format: DownloadFormat = DownloadFormat.CSV
+    delimiter: Delimiter = Delimiter.TAB  # solo aplica a TXT

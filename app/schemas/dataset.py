@@ -17,6 +17,7 @@ class DatasetOrigin(str, Enum):
     UPLOADED = "uploaded"  # subido por el usuario
     PIVOT = "pivot"        # generado por una tabla dinámica (reporte)
     COMPUTED = "computed"  # generado al añadir columnas calculadas
+    REPLACED = "replaced"  # generado por un buscar-y-reemplazar por columna
 
 
 class ColumnInfo(BaseModel):
