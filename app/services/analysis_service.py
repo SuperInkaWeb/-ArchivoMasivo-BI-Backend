@@ -15,7 +15,7 @@ from typing import Callable
 from app.core.config import get_settings
 from app.core.exceptions import DatasetNotReadyError
 from app.core.expression_builder import build_expression
-from app.core.pivot_builder import MAX_PIVOT_COLUMNS, build_pivot
+from app.core.pivot_builder import MAX_PIVOT_COLUMNS, build_pivot, build_pivot_totals
 from app.core.query_builder import InvalidFilterError, build_where, quote_column
 from app.core.replace_builder import build_replace_select
 from app.core.storage import parquet_key, parquet_locator, parquet_path
@@ -51,17 +51,32 @@ _DERIVED_EXTENSION = ".parquet"
 # ---------------------------------------------------------------------------
 
 def run_pivot(dataset_id: str, request: PivotRequest, owner_id: str) -> PivotResponse:
-    """Ejecuta el pivote y devuelve una página del reporte + total de filas agrupadas."""
-    select_sql, group_cols_sql, where_sql, params, where_params = _plan_pivot(dataset_id, request, owner_id)
+    """Ejecuta el pivote y devuelve una página del reporte + total de filas agrupadas.
+
+    Incluye la fila de Total general (métricas sobre todas las filas) para fijarla al pie
+    de la vista previa; no se persiste ni se descarga (solo la columna Total por fila sí).
+    """
+    _, valid_columns, numeric_columns, where_sql, where_params, pivot_values = _pivot_context(
+        dataset_id, request, owner_id
+    )
+    select_sql, group_cols_sql, order_sql, params = build_pivot(
+        request, valid_columns, numeric_columns, pivot_values
+    )
     parquet = parquet_locator(dataset_id)
     total = duckdb_engine.pivot_count(parquet, group_cols_sql, where_sql, where_params)
     columns, rows = duckdb_engine.pivot_preview(
         parquet, select_sql, group_cols_sql, where_sql, params + where_params,
-        request.limit, request.offset,
+        request.limit, request.offset, order_sql,
+    )
+    totals_select, totals_params = build_pivot_totals(
+        request, valid_columns, numeric_columns, pivot_values
+    )
+    totals = duckdb_engine.pivot_totals(
+        parquet, totals_select, where_sql, totals_params + where_params
     )
     return PivotResponse(
         columns=columns, rows=rows, total_matched=total,
-        limit=request.limit, offset=request.offset,
+        limit=request.limit, offset=request.offset, totals=totals,
     )
 
 
@@ -74,20 +89,24 @@ def start_pivot_save(dataset_id: str, request: PivotSaveRequest, owner_id: str) 
 def run_pivot_save(new_id: str, source_id: str, request: PivotSaveRequest, owner_id: str) -> None:
     """Tarea en segundo plano: materializa el pivote a Parquet y marca READY/FAILED."""
     def materialize() -> None:
-        select_sql, group_cols_sql, where_sql, params, where_params = _plan_pivot(source_id, request, owner_id)
+        select_sql, group_cols_sql, order_sql, where_sql, params, where_params = _plan_pivot(
+            source_id, request, owner_id
+        )
         duckdb_engine.pivot_to_parquet(
             parquet_locator(source_id), select_sql, group_cols_sql, where_sql,
-            params + where_params, parquet_locator(new_id),
+            params + where_params, parquet_locator(new_id), order_sql,
         )
     _finalize_derived(new_id, source_id, materialize)
 
 
 def export_pivot(dataset_id: str, request: PivotDownloadRequest, owner_id: str) -> export_service.ExportResult:
     """Descarga el reporte pivote COMPLETO como archivo (CSV/XLSX/TXT), sin persistirlo."""
-    detail, valid_columns = _require_ready_columns(dataset_id, owner_id)
-    where_sql, where_params = build_where(request.filter, valid_columns)
-    pivot_values = _distinct_pivot_values(dataset_id, request, valid_columns)
-    select_sql, group_cols_sql, params = build_pivot(request, valid_columns, pivot_values)
+    detail, valid_columns, numeric_columns, where_sql, where_params, pivot_values = _pivot_context(
+        dataset_id, request, owner_id
+    )
+    select_sql, group_cols_sql, order_sql, params = build_pivot(
+        request, valid_columns, numeric_columns, pivot_values
+    )
     parquet = parquet_locator(dataset_id)
     matched = duckdb_engine.pivot_count(parquet, group_cols_sql, where_sql, where_params)
     delimiter = request.delimiter.char if request.format is DownloadFormat.TXT else None
@@ -95,18 +114,40 @@ def export_pivot(dataset_id: str, request: PivotDownloadRequest, owner_id: str) 
         dataset_id, detail.original_filename, request.format, matched, "reporte",
         lambda dest: duckdb_engine.pivot_export_to_file(
             parquet, select_sql, group_cols_sql, where_sql,
-            params + where_params, dest, request.format.value, delimiter,
+            params + where_params, dest, request.format.value, delimiter, order_sql,
         ),
     )
 
 
-def _plan_pivot(dataset_id: str, request: PivotSpec, owner_id: str) -> tuple[str, str, str, list, list]:
-    """Valida y arma el SQL del pivote. Devuelve (select, group_cols, where, params, where_params)."""
-    _, valid_columns = _require_ready_columns(dataset_id, owner_id)
+def _pivot_context(
+    dataset_id: str, request: PivotSpec, owner_id: str
+) -> tuple[DatasetDetail, set[str], set[str], str, list, list | None]:
+    """Piezas comunes del pivote, calculadas una sola vez (DRY entre ver/guardar/descargar).
+
+    Devuelve (detalle, columnas_válidas, columnas_numéricas, where_sql, where_params,
+    valores_del_cross_tab).
+    """
+    detail, valid_columns = _require_ready_columns(dataset_id, owner_id)
+    numeric_columns = _numeric_columns(detail)
     where_sql, where_params = build_where(request.filter, valid_columns)
     pivot_values = _distinct_pivot_values(dataset_id, request, valid_columns)
-    select_sql, group_cols_sql, params = build_pivot(request, valid_columns, pivot_values)
-    return select_sql, group_cols_sql, where_sql, params, where_params
+    return detail, valid_columns, numeric_columns, where_sql, where_params, pivot_values
+
+
+def _plan_pivot(
+    dataset_id: str, request: PivotSpec, owner_id: str
+) -> tuple[str, str, str | None, str, list, list]:
+    """Valida y arma el SQL del pivote.
+
+    Devuelve (select, group_cols, order_sql, where, params, where_params).
+    """
+    _, valid_columns, numeric_columns, where_sql, where_params, pivot_values = _pivot_context(
+        dataset_id, request, owner_id
+    )
+    select_sql, group_cols_sql, order_sql, params = build_pivot(
+        request, valid_columns, numeric_columns, pivot_values
+    )
+    return select_sql, group_cols_sql, order_sql, where_sql, params, where_params
 
 
 def _distinct_pivot_values(dataset_id: str, request: PivotSpec, valid_columns: set[str]) -> list | None:
@@ -123,6 +164,19 @@ def _distinct_pivot_values(dataset_id: str, request: PivotSpec, valid_columns: s
             f"usarla como columnas (máximo {MAX_PIVOT_COLUMNS}). Filtra antes o elige otra."
         )
     return values
+
+
+# Subcadenas de tipo DuckDB que identifican columnas numéricas (INT cubre TINYINT..HUGEINT).
+_NUMERIC_TYPE_HINTS = ("INT", "DECIMAL", "DOUBLE", "FLOAT", "REAL", "NUMERIC")
+
+
+def _numeric_columns(detail: DatasetDetail) -> set[str]:
+    """Nombres de columnas numéricas del dataset (para validar SUMA/PROMEDIO)."""
+    return {
+        column.name
+        for column in detail.columns
+        if any(hint in column.type.upper() for hint in _NUMERIC_TYPE_HINTS)
+    }
 
 
 # ---------------------------------------------------------------------------

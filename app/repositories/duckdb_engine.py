@@ -295,27 +295,49 @@ def export_to_file(
     _copy_query_to_file(inner, params, dest_path, fmt, delimiter)
 
 
-def _pivot_body(parquet: str, select_sql: str, where_sql: str, group_cols_sql: str) -> str:
-    """SELECT completo del pivote (proyección + WHERE + GROUP BY + ORDER BY)."""
+def _pivot_body(
+    parquet: str, select_sql: str, where_sql: str, group_cols_sql: str,
+    order_sql: str | None = None,
+) -> str:
+    """SELECT completo del pivote (proyección + WHERE + GROUP BY + ORDER BY).
+
+    `order_sql` sustituye el orden por defecto (por columnas de agrupación) cuando el
+    usuario pide ordenar por una métrica.
+    """
     where_clause = f"WHERE {where_sql}" if where_sql else ""
     return (
         f"SELECT {select_sql} FROM read_parquet({_sql_path(parquet)}) "
-        f"{where_clause} GROUP BY {group_cols_sql} ORDER BY {group_cols_sql}"
+        f"{where_clause} GROUP BY {group_cols_sql} ORDER BY {order_sql or group_cols_sql}"
     )
 
 
 def pivot_preview(
     parquet: str, select_sql: str, group_cols_sql: str, where_sql: str,
-    params: list, limit: int, offset: int,
+    params: list, limit: int, offset: int, order_sql: str | None = None,
 ) -> tuple[list[str], list[dict]]:
     """Una página del reporte pivote. `params` = params del SELECT + params del WHERE."""
-    body = _pivot_body(parquet, select_sql, where_sql, group_cols_sql)
+    body = _pivot_body(parquet, select_sql, where_sql, group_cols_sql, order_sql)
     sql = f"SELECT * FROM ({body}) LIMIT {int(limit)} OFFSET {int(offset)}"
     with _connect() as con:
         cursor = con.execute(sql, params)
         column_names = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
     return column_names, [dict(zip(column_names, row)) for row in rows]
+
+
+def pivot_totals(parquet: str, select_sql: str, where_sql: str, params: list) -> dict:
+    """Fila de Total general del pivote: las mismas métricas sin GROUP BY (una sola fila).
+
+    `select_sql` son las piezas de agregación (sin columnas de agrupación); `params` son
+    sus parámetros (valores del cross-tab) seguidos de los del WHERE.
+    """
+    where_clause = f"WHERE {where_sql}" if where_sql else ""
+    sql = f"SELECT {select_sql} FROM read_parquet({_sql_path(parquet)}) {where_clause}"
+    with _connect() as con:
+        cursor = con.execute(sql, params)
+        column_names = [desc[0] for desc in cursor.description]
+        row = cursor.fetchone()
+    return dict(zip(column_names, row)) if row else {}
 
 
 def pivot_count(parquet: str, group_cols_sql: str, where_sql: str, where_params: list) -> int:
@@ -335,10 +357,10 @@ def pivot_count(parquet: str, group_cols_sql: str, where_sql: str, where_params:
 
 def pivot_to_parquet(
     parquet: str, select_sql: str, group_cols_sql: str, where_sql: str,
-    params: list, dest: str,
+    params: list, dest: str, order_sql: str | None = None,
 ) -> None:
     """Materializa el reporte pivote a un Parquet nuevo (para 'guardar como archivo')."""
-    body = _pivot_body(parquet, select_sql, where_sql, group_cols_sql)
+    body = _pivot_body(parquet, select_sql, where_sql, group_cols_sql, order_sql)
     with _connect() as con:
         con.execute(f"COPY ({body}) TO {_sql_path(dest)} (FORMAT PARQUET)", params)
 
@@ -346,9 +368,10 @@ def pivot_to_parquet(
 def pivot_export_to_file(
     parquet: str, select_sql: str, group_cols_sql: str, where_sql: str,
     params: list, dest_path: str, fmt: str, delimiter: str | None = None,
+    order_sql: str | None = None,
 ) -> None:
     """Exporta el reporte pivote completo a un archivo LOCAL (CSV/TXT/XLSX) vía COPY."""
-    body = _pivot_body(parquet, select_sql, where_sql, group_cols_sql)
+    body = _pivot_body(parquet, select_sql, where_sql, group_cols_sql, order_sql)
     _copy_query_to_file(body, params, dest_path, fmt, delimiter)
 
 

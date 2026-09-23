@@ -13,7 +13,7 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 from app.schemas.expression import ComputedColumn
-from app.schemas.filter import Delimiter, DownloadFormat, FilterGroup
+from app.schemas.filter import Delimiter, DownloadFormat, FilterGroup, SortDirection
 
 
 class Aggregation(str, Enum):
@@ -34,6 +34,18 @@ class Measure(BaseModel):
     aggregation: Aggregation
 
 
+class PivotSort(BaseModel):
+    """Orden del reporte: por una columna de agrupación o por una métrica.
+
+    Exactamente uno de `column` / `measure_index`. Si ambos son None, se ordena por
+    las columnas de agrupación (comportamiento por defecto). Ordenar por métrica
+    permite ver el "top N" (p. ej. clientes de mayor a menor venta).
+    """
+    column: str | None = None
+    measure_index: int | None = Field(default=None, ge=0)
+    direction: SortDirection = SortDirection.DESC
+
+
 class PivotSpec(BaseModel):
     """Definición de un pivote (sin paginación ni destino).
 
@@ -46,6 +58,10 @@ class PivotSpec(BaseModel):
     measures: list[Measure] = Field(min_length=1, max_length=10)
     # Cross-tab opcional: sus valores distintos se convierten en columnas.
     pivot_column: str | None = None
+    # Orden del reporte; None = por columnas de agrupación.
+    sort: PivotSort | None = None
+    # Mostrar cada valor como % del total de su métrica (solo Suma/Conteo).
+    percent_of_total: bool = False
 
 
 class PivotRequest(PivotSpec):
@@ -60,6 +76,9 @@ class PivotResponse(BaseModel):
     total_matched: int  # nº de filas agrupadas del reporte completo
     limit: int
     offset: int
+    # Fila de Total general (métricas agregadas sobre todas las filas), sin las columnas
+    # de agrupación. None si no aplica. Solo para la vista previa, no se persiste.
+    totals: dict | None = None
 
 
 class PivotSaveRequest(PivotSpec):
