@@ -155,6 +155,33 @@ def build_where(root: FilterGroup | None, valid_columns: set[str]) -> tuple[str,
     return _build_node(root, valid_columns)
 
 
+def _build_search(term: str, valid_columns: set[str]) -> tuple[str, list]:
+    """Búsqueda global insensible: (col1 ILIKE ? OR col2 ILIKE ? ...) sobre todas las columnas.
+
+    Castea cada columna a texto (funciona en cualquier tipo) y el término va como
+    parámetro; los comodines LIKE del usuario se escapan para búsqueda literal.
+    """
+    pattern = f"%{_escape_like(term)}%"
+    clauses: list[str] = []
+    params: list = []
+    for name in valid_columns:
+        clauses.append(f"CAST({_quote_ident(name, valid_columns)} AS VARCHAR) ILIKE ? ESCAPE '\\'")
+        params.append(pattern)
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def apply_search(
+    where_sql: str, params: list, term: str | None, valid_columns: set[str]
+) -> tuple[str, list]:
+    """Combina (Y) un WHERE existente con la búsqueda global, si hay término."""
+    if not term or not term.strip() or not valid_columns:
+        return where_sql, params
+    search_sql, search_params = _build_search(term.strip(), valid_columns)
+    if where_sql:
+        return f"({where_sql}) AND {search_sql}", params + search_params
+    return search_sql, search_params
+
+
 def build_select(select: list[str], valid_columns: set[str]) -> str:
     """Lista de columnas a proyectar. Vacío => '*'. Cada columna validada."""
     if not select:

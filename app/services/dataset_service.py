@@ -12,7 +12,7 @@ from fastapi import Request
 
 from app.core.config import get_settings
 from app.core.exceptions import DatasetNotFoundError, DatasetNotReadyError, InvalidSheetError
-from app.core.query_builder import build_order_by, build_select, build_where, quote_column
+from app.core.query_builder import apply_search, build_order_by, build_select, build_where, quote_column
 from app.core.storage import (
     parquet_key,
     parquet_locator,
@@ -190,6 +190,7 @@ def preview(dataset_id: str, request: PreviewRequest, owner_id: str) -> PreviewR
     valid_columns = {col.name for col in detail.columns}
 
     where_sql, params = build_where(request.filter, valid_columns)
+    where_sql, params = apply_search(where_sql, params, request.search, valid_columns)
     select_sql = build_select(request.select, valid_columns)
     order_sql = build_order_by(request.sort, valid_columns)
     parquet = parquet_locator(dataset_id)

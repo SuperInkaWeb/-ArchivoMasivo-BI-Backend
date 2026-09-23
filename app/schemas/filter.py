@@ -82,6 +82,8 @@ class FilterRequest(BaseModel):
 class PreviewRequest(FilterRequest):
     limit: int = Field(default=100, ge=1, le=1000)
     offset: int = Field(default=0, ge=0)
+    # Búsqueda global: texto que debe aparecer en cualquier columna (insensible).
+    search: str | None = Field(default=None, max_length=200)
 
 
 class PreviewResponse(BaseModel):
@@ -123,6 +125,8 @@ class DownloadRequest(FilterRequest):
     format: DownloadFormat = DownloadFormat.CSV
     # Separador para TXT; se ignora en CSV/XLSX.
     delimiter: Delimiter = Delimiter.TAB
+    # Búsqueda global aplicada además del filtro (misma que la vista previa).
+    search: str | None = Field(default=None, max_length=200)
 
 
 class DistinctValuesResponse(BaseModel):
