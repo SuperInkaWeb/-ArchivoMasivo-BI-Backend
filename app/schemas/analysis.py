@@ -159,3 +159,40 @@ class ReplaceDownloadRequest(ReplaceSpec):
     """Correcciones que se descargan como archivo (CSV/XLSX/TXT)."""
     format: DownloadFormat = DownloadFormat.CSV
     delimiter: Delimiter = Delimiter.TAB  # solo aplica a TXT
+
+
+class DedupeSpec(BaseModel):
+    """Definición de un 'eliminar duplicados' (sin paginación ni destino).
+
+    `key_columns` define qué hace duplicada a una fila: si está vacío, se comparan
+    TODAS las columnas (filas idénticas). Si trae columnas, se conserva la primera
+    fila de cada combinación de esas columnas.
+    """
+    filter: FilterGroup | None = None
+    key_columns: list[str] = Field(default_factory=list, max_length=50)
+
+
+class DedupeRequest(DedupeSpec):
+    """Eliminar duplicados para VER (una página del resultado)."""
+    limit: int = Field(default=100, ge=1, le=1000)
+    offset: int = Field(default=0, ge=0)
+
+
+class DedupeResponse(BaseModel):
+    columns: list[str]
+    rows: list[dict]
+    total_matched: int   # filas únicas resultantes
+    total_original: int  # filas antes de quitar duplicados (con el filtro aplicado)
+    limit: int
+    offset: int
+
+
+class DedupeSaveRequest(DedupeSpec):
+    """Resultado sin duplicados que se persiste como un dataset nuevo."""
+    name: str = Field(min_length=1, max_length=120)
+
+
+class DedupeDownloadRequest(DedupeSpec):
+    """Resultado sin duplicados que se descarga como archivo (CSV/XLSX/TXT)."""
+    format: DownloadFormat = DownloadFormat.CSV
+    delimiter: Delimiter = Delimiter.TAB  # solo aplica a TXT

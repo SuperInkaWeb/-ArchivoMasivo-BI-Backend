@@ -14,6 +14,7 @@ from typing import Callable
 
 from app.core.config import get_settings
 from app.core.exceptions import DatasetNotReadyError
+from app.core.dedupe_builder import build_dedupe
 from app.core.expression_builder import build_expression
 from app.core.pivot_builder import MAX_PIVOT_COLUMNS, build_pivot, build_pivot_totals
 from app.core.query_builder import InvalidFilterError, build_where, quote_column
@@ -26,6 +27,11 @@ from app.schemas.analysis import (
     ComputeRequest,
     ComputeSaveRequest,
     ComputeSpec,
+    DedupeDownloadRequest,
+    DedupeRequest,
+    DedupeResponse,
+    DedupeSaveRequest,
+    DedupeSpec,
     PivotDownloadRequest,
     PivotRequest,
     PivotResponse,
@@ -318,6 +324,68 @@ def _plan_replace(dataset_id: str, request: ReplaceSpec, owner_id: str) -> tuple
     column_order = [column.name for column in detail.columns]
     select_sql, params = build_replace_select(request.replacements, column_order, valid_columns)
     return select_sql, where_sql, params, where_params
+
+
+# ---------------------------------------------------------------------------
+# Eliminar duplicados
+# ---------------------------------------------------------------------------
+
+def run_dedupe(dataset_id: str, request: DedupeRequest, owner_id: str) -> DedupeResponse:
+    """Quita duplicados y devuelve una página + cuántas filas quedaron y cuántas había."""
+    select_sql, where_sql, qualify_sql, where_params = _plan_dedupe(dataset_id, request, owner_id)
+    parquet = parquet_locator(dataset_id)
+    original = duckdb_engine.count_matches(parquet, where_sql, where_params)
+    total = duckdb_engine.dedupe_count(parquet, select_sql, where_sql, qualify_sql, where_params)
+    columns, rows = duckdb_engine.dedupe_preview(
+        parquet, select_sql, where_sql, qualify_sql, where_params,
+        request.limit, request.offset,
+    )
+    return DedupeResponse(
+        columns=columns, rows=rows, total_matched=total, total_original=original,
+        limit=request.limit, offset=request.offset,
+    )
+
+
+def start_dedupe_save(dataset_id: str, request: DedupeSaveRequest, owner_id: str) -> DatasetSummary:
+    """Crea el registro del dataset sin duplicados en PROCESSING y lo devuelve."""
+    dataset_service.get_dataset(dataset_id, owner_id)
+    return _start_derived(owner_id, request.name.strip(), DatasetOrigin.DEDUPED)
+
+
+def run_dedupe_save(new_id: str, source_id: str, request: DedupeSaveRequest, owner_id: str) -> None:
+    """Tarea en segundo plano: materializa el resultado sin duplicados y marca READY/FAILED."""
+    def materialize() -> None:
+        select_sql, where_sql, qualify_sql, where_params = _plan_dedupe(source_id, request, owner_id)
+        duckdb_engine.dedupe_to_parquet(
+            parquet_locator(source_id), select_sql, where_sql, qualify_sql,
+            where_params, parquet_locator(new_id),
+        )
+    _finalize_derived(new_id, source_id, materialize)
+
+
+def export_dedupe(dataset_id: str, request: DedupeDownloadRequest, owner_id: str) -> export_service.ExportResult:
+    """Descarga TODAS las filas sin duplicados como archivo (CSV/XLSX/TXT)."""
+    detail, valid_columns = _require_ready_columns(dataset_id, owner_id)
+    where_sql, where_params = build_where(request.filter, valid_columns)
+    select_sql, qualify_sql = build_dedupe(request.key_columns, valid_columns)
+    parquet = parquet_locator(dataset_id)
+    matched = duckdb_engine.dedupe_count(parquet, select_sql, where_sql, qualify_sql, where_params)
+    delimiter = request.delimiter.char if request.format is DownloadFormat.TXT else None
+    return export_service.write_export(
+        dataset_id, detail.original_filename, request.format, matched, "sin_duplicados",
+        lambda dest: duckdb_engine.dedupe_export_to_file(
+            parquet, select_sql, where_sql, qualify_sql, where_params,
+            dest, request.format.value, delimiter,
+        ),
+    )
+
+
+def _plan_dedupe(dataset_id: str, request: DedupeSpec, owner_id: str) -> tuple[str, str, str | None, list]:
+    """Valida y arma el SQL de dedupe. Devuelve (select, where, qualify, where_params)."""
+    _, valid_columns = _require_ready_columns(dataset_id, owner_id)
+    where_sql, where_params = build_where(request.filter, valid_columns)
+    select_sql, qualify_sql = build_dedupe(request.key_columns, valid_columns)
+    return select_sql, where_sql, qualify_sql, where_params
 
 
 # ---------------------------------------------------------------------------

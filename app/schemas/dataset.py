@@ -18,6 +18,7 @@ class DatasetOrigin(str, Enum):
     PIVOT = "pivot"        # generado por una tabla dinámica (reporte)
     COMPUTED = "computed"  # generado al añadir columnas calculadas
     REPLACED = "replaced"  # generado por un buscar-y-reemplazar por columna
+    DEDUPED = "deduped"    # generado al eliminar filas duplicadas
 
 
 class ColumnInfo(BaseModel):

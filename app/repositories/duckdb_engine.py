@@ -375,6 +375,60 @@ def pivot_export_to_file(
     _copy_query_to_file(body, params, dest_path, fmt, delimiter)
 
 
+def _dedupe_body(
+    parquet: str, select_sql: str, where_sql: str, qualify_sql: str | None
+) -> str:
+    """SELECT que quita duplicados (proyección + WHERE + QUALIFY)."""
+    where_clause = f"WHERE {where_sql}" if where_sql else ""
+    qualify_clause = f"QUALIFY {qualify_sql}" if qualify_sql else ""
+    return (
+        f"SELECT {select_sql} FROM read_parquet({_sql_path(parquet)}) "
+        f"{where_clause} {qualify_clause}"
+    )
+
+
+def dedupe_preview(
+    parquet: str, select_sql: str, where_sql: str, qualify_sql: str | None,
+    params: list, limit: int, offset: int,
+) -> tuple[list[str], list[dict]]:
+    """Una página del resultado sin duplicados."""
+    body = _dedupe_body(parquet, select_sql, where_sql, qualify_sql)
+    sql = f"SELECT * FROM ({body}) LIMIT {int(limit)} OFFSET {int(offset)}"
+    with _connect() as con:
+        cursor = con.execute(sql, params)
+        column_names = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+    return column_names, [dict(zip(column_names, row)) for row in rows]
+
+
+def dedupe_count(
+    parquet: str, select_sql: str, where_sql: str, qualify_sql: str | None, params: list
+) -> int:
+    """Nº de filas únicas resultantes (para paginación y para calcular las quitadas)."""
+    body = _dedupe_body(parquet, select_sql, where_sql, qualify_sql)
+    with _connect() as con:
+        return int(con.execute(f"SELECT count(*) FROM ({body})", params).fetchone()[0])
+
+
+def dedupe_to_parquet(
+    parquet: str, select_sql: str, where_sql: str, qualify_sql: str | None,
+    params: list, dest: str,
+) -> None:
+    """Materializa el resultado sin duplicados a un Parquet nuevo."""
+    body = _dedupe_body(parquet, select_sql, where_sql, qualify_sql)
+    with _connect() as con:
+        con.execute(f"COPY ({body}) TO {_sql_path(dest)} (FORMAT PARQUET)", params)
+
+
+def dedupe_export_to_file(
+    parquet: str, select_sql: str, where_sql: str, qualify_sql: str | None,
+    params: list, dest_path: str, fmt: str, delimiter: str | None = None,
+) -> None:
+    """Exporta el resultado sin duplicados completo a un archivo LOCAL (CSV/TXT/XLSX)."""
+    body = _dedupe_body(parquet, select_sql, where_sql, qualify_sql)
+    _copy_query_to_file(body, params, dest_path, fmt, delimiter)
+
+
 def materialize_to_parquet(
     parquet: str, select_sql: str, where_sql: str, params: list, dest: str,
 ) -> None:
