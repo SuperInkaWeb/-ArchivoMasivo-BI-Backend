@@ -57,6 +57,9 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Necesarios para las descargas desde el navegador (origen distinto en prod):
+        # el nombre del archivo y el tamaño para la barra de progreso.
+        expose_headers=["Content-Disposition", "Content-Length"],
     )
 
     _register_error_handlers(app)
