@@ -98,7 +98,17 @@ class ComputeSpec(BaseModel):
     columns: list[ComputedColumn] = Field(min_length=1, max_length=20)
 
 
-class ComputeRequest(ComputeSpec):
+class SortablePreview(BaseModel):
+    """Orden opcional de una vista paginada: por una columna del RESULTADO.
+
+    La columna se valida contra las columnas reales del resultado (whitelist) antes
+    de tocar la BD; None = orden natural.
+    """
+    order_column: str | None = None
+    order_direction: SortDirection = SortDirection.ASC
+
+
+class ComputeRequest(ComputeSpec, SortablePreview):
     """Columnas calculadas para VER (una página)."""
     limit: int = Field(default=100, ge=1, le=1000)
     offset: int = Field(default=0, ge=0)
@@ -144,7 +154,7 @@ class ReplaceSpec(BaseModel):
     replacements: list[ReplacementRule] = Field(min_length=1, max_length=20)
 
 
-class ReplaceRequest(ReplaceSpec):
+class ReplaceRequest(ReplaceSpec, SortablePreview):
     """Buscar y reemplazar para VER (una página, con las correcciones aplicadas)."""
     limit: int = Field(default=100, ge=1, le=1000)
     offset: int = Field(default=0, ge=0)
@@ -172,7 +182,7 @@ class DedupeSpec(BaseModel):
     key_columns: list[str] = Field(default_factory=list, max_length=50)
 
 
-class DedupeRequest(DedupeSpec):
+class DedupeRequest(DedupeSpec, SortablePreview):
     """Eliminar duplicados para VER (una página del resultado)."""
     limit: int = Field(default=100, ge=1, le=1000)
     offset: int = Field(default=0, ge=0)

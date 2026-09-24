@@ -389,11 +389,11 @@ def _dedupe_body(
 
 def dedupe_preview(
     parquet: str, select_sql: str, where_sql: str, qualify_sql: str | None,
-    params: list, limit: int, offset: int,
+    params: list, limit: int, offset: int, order_sql: str = "",
 ) -> tuple[list[str], list[dict]]:
-    """Una página del resultado sin duplicados."""
+    """Una página del resultado sin duplicados. `order_sql` es la cláusula ORDER BY completa."""
     body = _dedupe_body(parquet, select_sql, where_sql, qualify_sql)
-    sql = f"SELECT * FROM ({body}) LIMIT {int(limit)} OFFSET {int(offset)}"
+    sql = f"SELECT * FROM ({body}) {order_sql} LIMIT {int(limit)} OFFSET {int(offset)}"
     with _connect() as con:
         cursor = con.execute(sql, params)
         column_names = [desc[0] for desc in cursor.description]

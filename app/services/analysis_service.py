@@ -43,13 +43,26 @@ from app.schemas.analysis import (
     ReplaceSpec,
 )
 from app.schemas.dataset import DatasetDetail, DatasetOrigin, DatasetSummary, IngestStatus
-from app.schemas.filter import DownloadFormat, PreviewResponse
+from app.schemas.filter import DownloadFormat, PreviewResponse, SortDirection
 from app.services import dataset_service, export_service
 
 logger = logging.getLogger(__name__)
 
 # Extensión lógica de un dataset derivado: sus datos ya viven en Parquet (sin crudo).
 _DERIVED_EXTENSION = ".parquet"
+
+
+def _order_clause(order_column: str | None, direction: SortDirection, allowed_columns: set[str]) -> str:
+    """ORDER BY validado por una columna del resultado (whitelist), o '' si no aplica.
+
+    `allowed_columns` son las columnas reales del resultado; para columnas calculadas
+    incluye también sus alias. El nombre se cita como identificador (defensa A03).
+    """
+    if not order_column:
+        return ""
+    column_sql = quote_column(order_column, allowed_columns)
+    sort = "DESC" if direction is SortDirection.DESC else "ASC"
+    return f"ORDER BY {column_sql} {sort}"
 
 
 # ---------------------------------------------------------------------------
@@ -194,10 +207,13 @@ def run_compute(dataset_id: str, request: ComputeRequest, owner_id: str) -> Prev
     _, valid_columns = _require_ready_columns(dataset_id, owner_id)
     where_sql, where_params = build_where(request.filter, valid_columns)
     select_sql, compute_params = _compute_select(request, valid_columns)
+    # El resultado incluye las columnas originales y las calculadas: por ambas se puede ordenar.
+    result_columns = valid_columns | {column.name.strip() for column in request.columns}
+    order_sql = _order_clause(request.order_column, request.order_direction, result_columns)
     parquet = parquet_locator(dataset_id)
     total = duckdb_engine.count_matches(parquet, where_sql, where_params)
     columns, rows = duckdb_engine.preview(
-        parquet, select_sql, where_sql, "", request.limit, request.offset,
+        parquet, select_sql, where_sql, order_sql, request.limit, request.offset,
         compute_params + where_params,
     )
     return PreviewResponse(
@@ -272,11 +288,12 @@ def _quote_alias(alias: str) -> str:
 
 def run_replace(dataset_id: str, request: ReplaceRequest, owner_id: str) -> PreviewResponse:
     """Aplica las correcciones y devuelve una página (todas las columnas, ya corregidas)."""
-    select_sql, where_sql, params, where_params = _plan_replace(dataset_id, request, owner_id)
+    valid_columns, select_sql, where_sql, params, where_params = _plan_replace(dataset_id, request, owner_id)
+    order_sql = _order_clause(request.order_column, request.order_direction, valid_columns)
     parquet = parquet_locator(dataset_id)
     total = duckdb_engine.count_matches(parquet, where_sql, where_params)
     columns, rows = duckdb_engine.preview(
-        parquet, select_sql, where_sql, "", request.limit, request.offset, params + where_params,
+        parquet, select_sql, where_sql, order_sql, request.limit, request.offset, params + where_params,
     )
     return PreviewResponse(
         columns=columns, rows=rows, total_matched=total,
@@ -293,7 +310,7 @@ def start_replace_save(dataset_id: str, request: ReplaceSaveRequest, owner_id: s
 def run_replace_save(new_id: str, source_id: str, request: ReplaceSaveRequest, owner_id: str) -> None:
     """Tarea en segundo plano: materializa las correcciones y marca READY/FAILED."""
     def materialize() -> None:
-        select_sql, where_sql, params, where_params = _plan_replace(source_id, request, owner_id)
+        _, select_sql, where_sql, params, where_params = _plan_replace(source_id, request, owner_id)
         duckdb_engine.materialize_to_parquet(
             parquet_locator(source_id), select_sql, where_sql,
             params + where_params, parquet_locator(new_id),
@@ -304,7 +321,7 @@ def run_replace_save(new_id: str, source_id: str, request: ReplaceSaveRequest, o
 def export_replace(dataset_id: str, request: ReplaceDownloadRequest, owner_id: str) -> export_service.ExportResult:
     """Descarga TODAS las filas ya corregidas como archivo (CSV/XLSX/TXT)."""
     detail, _ = _require_ready_columns(dataset_id, owner_id)
-    select_sql, where_sql, params, where_params = _plan_replace(dataset_id, request, owner_id)
+    _, select_sql, where_sql, params, where_params = _plan_replace(dataset_id, request, owner_id)
     parquet = parquet_locator(dataset_id)
     matched = duckdb_engine.count_matches(parquet, where_sql, where_params)
     delimiter = request.delimiter.char if request.format is DownloadFormat.TXT else None
@@ -317,13 +334,17 @@ def export_replace(dataset_id: str, request: ReplaceDownloadRequest, owner_id: s
     )
 
 
-def _plan_replace(dataset_id: str, request: ReplaceSpec, owner_id: str) -> tuple[str, str, list, list]:
-    """Valida y arma el SQL de corrección. Devuelve (select, where, params, where_params)."""
+def _plan_replace(dataset_id: str, request: ReplaceSpec, owner_id: str) -> tuple[set[str], str, str, list, list]:
+    """Valida y arma el SQL de corrección.
+
+    Devuelve (valid_columns, select, where, params, where_params). El resultado conserva
+    las columnas originales, así que `valid_columns` sirve también para validar el orden.
+    """
     detail, valid_columns = _require_ready_columns(dataset_id, owner_id)
     where_sql, where_params = build_where(request.filter, valid_columns)
     column_order = [column.name for column in detail.columns]
     select_sql, params = build_replace_select(request.replacements, column_order, valid_columns)
-    return select_sql, where_sql, params, where_params
+    return valid_columns, select_sql, where_sql, params, where_params
 
 
 # ---------------------------------------------------------------------------
@@ -332,13 +353,14 @@ def _plan_replace(dataset_id: str, request: ReplaceSpec, owner_id: str) -> tuple
 
 def run_dedupe(dataset_id: str, request: DedupeRequest, owner_id: str) -> DedupeResponse:
     """Quita duplicados y devuelve una página + cuántas filas quedaron y cuántas había."""
-    select_sql, where_sql, qualify_sql, where_params = _plan_dedupe(dataset_id, request, owner_id)
+    valid_columns, select_sql, where_sql, qualify_sql, where_params = _plan_dedupe(dataset_id, request, owner_id)
+    order_sql = _order_clause(request.order_column, request.order_direction, valid_columns)
     parquet = parquet_locator(dataset_id)
     original = duckdb_engine.count_matches(parquet, where_sql, where_params)
     total = duckdb_engine.dedupe_count(parquet, select_sql, where_sql, qualify_sql, where_params)
     columns, rows = duckdb_engine.dedupe_preview(
         parquet, select_sql, where_sql, qualify_sql, where_params,
-        request.limit, request.offset,
+        request.limit, request.offset, order_sql,
     )
     return DedupeResponse(
         columns=columns, rows=rows, total_matched=total, total_original=original,
@@ -355,7 +377,7 @@ def start_dedupe_save(dataset_id: str, request: DedupeSaveRequest, owner_id: str
 def run_dedupe_save(new_id: str, source_id: str, request: DedupeSaveRequest, owner_id: str) -> None:
     """Tarea en segundo plano: materializa el resultado sin duplicados y marca READY/FAILED."""
     def materialize() -> None:
-        select_sql, where_sql, qualify_sql, where_params = _plan_dedupe(source_id, request, owner_id)
+        _, select_sql, where_sql, qualify_sql, where_params = _plan_dedupe(source_id, request, owner_id)
         duckdb_engine.dedupe_to_parquet(
             parquet_locator(source_id), select_sql, where_sql, qualify_sql,
             where_params, parquet_locator(new_id),
@@ -380,12 +402,16 @@ def export_dedupe(dataset_id: str, request: DedupeDownloadRequest, owner_id: str
     )
 
 
-def _plan_dedupe(dataset_id: str, request: DedupeSpec, owner_id: str) -> tuple[str, str, str | None, list]:
-    """Valida y arma el SQL de dedupe. Devuelve (select, where, qualify, where_params)."""
+def _plan_dedupe(dataset_id: str, request: DedupeSpec, owner_id: str) -> tuple[set[str], str, str, str | None, list]:
+    """Valida y arma el SQL de dedupe.
+
+    Devuelve (valid_columns, select, where, qualify, where_params). El resultado conserva
+    las columnas originales, así que `valid_columns` sirve también para validar el orden.
+    """
     _, valid_columns = _require_ready_columns(dataset_id, owner_id)
     where_sql, where_params = build_where(request.filter, valid_columns)
     select_sql, qualify_sql = build_dedupe(request.key_columns, valid_columns)
-    return select_sql, where_sql, qualify_sql, where_params
+    return valid_columns, select_sql, where_sql, qualify_sql, where_params
 
 
 # ---------------------------------------------------------------------------
