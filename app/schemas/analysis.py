@@ -206,3 +206,30 @@ class DedupeDownloadRequest(DedupeSpec):
     """Resultado sin duplicados que se descarga como archivo (CSV/XLSX/TXT)."""
     format: DownloadFormat = DownloadFormat.CSV
     delimiter: Delimiter = Delimiter.TAB  # solo aplica a TXT
+
+
+class StatsRequest(BaseModel):
+    """Estadísticas descriptivas de UNA columna (respetando el filtro)."""
+    filter: FilterGroup | None = None
+    column: str
+
+
+class TopValue(BaseModel):
+    """Un valor frecuente de la columna y cuántas veces aparece."""
+    value: str
+    count: int
+
+
+class ColumnStats(BaseModel):
+    """Perfil descriptivo de una columna."""
+    column: str
+    is_numeric: bool
+    total: int       # filas consideradas (con el filtro)
+    non_null: int
+    nulls: int
+    distinct: int
+    minimum: str | float | int | None
+    maximum: str | float | int | None
+    total_sum: float | None = None  # solo columnas numéricas
+    average: float | None = None    # solo columnas numéricas
+    top_values: list[TopValue]

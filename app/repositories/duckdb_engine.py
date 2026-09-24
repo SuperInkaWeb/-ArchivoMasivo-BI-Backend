@@ -439,6 +439,41 @@ def materialize_to_parquet(
         con.execute(f"COPY ({body}) TO {_sql_path(dest)} (FORMAT PARQUET)", params)
 
 
+def column_stats(
+    parquet: str, column_sql: str, where_sql: str, params: list, numeric: bool
+) -> tuple:
+    """Agregados descriptivos de una columna en una sola pasada.
+
+    Devuelve (total, non_null, distinct, min, max[, sum, avg]). Suma/promedio solo se
+    piden para columnas numéricas. `column_sql` ya viene validado/citado (whitelist).
+    """
+    where_clause = f"WHERE {where_sql}" if where_sql else ""
+    extra = f", round(sum({column_sql}), 6), round(avg({column_sql}), 6)" if numeric else ""
+    sql = (
+        f"SELECT count(*), count({column_sql}), count(DISTINCT {column_sql}), "
+        f"min({column_sql}), max({column_sql}){extra} "
+        f"FROM read_parquet({_sql_path(parquet)}) {where_clause}"
+    )
+    with _connect() as con:
+        return con.execute(sql, params).fetchone()
+
+
+def column_top_values(
+    parquet: str, column_sql: str, where_sql: str, params: list, limit: int
+) -> list[tuple[str, int]]:
+    """Valores más frecuentes de una columna (excluye NULL)."""
+    not_null = f"{column_sql} IS NOT NULL"
+    where_clause = f"WHERE {where_sql} AND {not_null}" if where_sql else f"WHERE {not_null}"
+    sql = (
+        f"SELECT CAST({column_sql} AS VARCHAR) AS value, count(*) AS freq "
+        f"FROM read_parquet({_sql_path(parquet)}) {where_clause} "
+        f"GROUP BY {column_sql} ORDER BY freq DESC, value LIMIT {int(limit)}"
+    )
+    with _connect() as con:
+        rows = con.execute(sql, params).fetchall()
+    return [(str(row[0]), int(row[1])) for row in rows]
+
+
 def distinct_values(
     parquet: str,
     column_sql: str,

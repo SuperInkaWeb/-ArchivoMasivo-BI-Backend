@@ -13,6 +13,7 @@ from starlette.responses import FileResponse
 from app.core.rate_limit import download_limit, limiter, upload_limit
 from app.core.security import CurrentUser, get_current_user
 from app.schemas.analysis import (
+    ColumnStats,
     ComputeDownloadRequest,
     ComputeRequest,
     ComputeSaveRequest,
@@ -27,6 +28,7 @@ from app.schemas.analysis import (
     ReplaceDownloadRequest,
     ReplaceRequest,
     ReplaceSaveRequest,
+    StatsRequest,
 )
 from app.schemas.dataset import DatasetSummary
 from app.schemas.filter import PreviewResponse
@@ -217,3 +219,15 @@ def dedupe_save(
     summary = analysis_service.start_dedupe_save(dataset_id, body, user.sub)
     background_tasks.add_task(analysis_service.run_dedupe_save, summary.id, dataset_id, body, user.sub)
     return summary
+
+
+@router.post("/{dataset_id}/stats", response_model=ColumnStats)
+@limiter.limit(download_limit)
+def stats_view(
+    request: Request,
+    dataset_id: str,
+    body: StatsRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> ColumnStats:
+    """Devuelve el perfil descriptivo de una columna (respetando el filtro)."""
+    return analysis_service.run_stats(dataset_id, body, user.sub)

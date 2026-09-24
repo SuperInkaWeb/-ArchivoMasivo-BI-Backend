@@ -23,6 +23,7 @@ from app.core.storage import parquet_key, parquet_locator, parquet_path
 from app.repositories import dataset_repository as repo
 from app.repositories import duckdb_engine, r2_client
 from app.schemas.analysis import (
+    ColumnStats,
     ComputeDownloadRequest,
     ComputeRequest,
     ComputeSaveRequest,
@@ -41,6 +42,8 @@ from app.schemas.analysis import (
     ReplaceRequest,
     ReplaceSaveRequest,
     ReplaceSpec,
+    StatsRequest,
+    TopValue,
 )
 from app.schemas.dataset import DatasetDetail, DatasetOrigin, DatasetSummary, IngestStatus
 from app.schemas.filter import DownloadFormat, PreviewResponse, SortDirection
@@ -412,6 +415,49 @@ def _plan_dedupe(dataset_id: str, request: DedupeSpec, owner_id: str) -> tuple[s
     where_sql, where_params = build_where(request.filter, valid_columns)
     select_sql, qualify_sql = build_dedupe(request.key_columns, valid_columns)
     return valid_columns, select_sql, where_sql, qualify_sql, where_params
+
+
+# ---------------------------------------------------------------------------
+# Estadísticas por columna
+# ---------------------------------------------------------------------------
+
+# Cuántos valores frecuentes se muestran en el perfil de una columna.
+_STATS_TOP_LIMIT = 10
+
+
+def run_stats(dataset_id: str, request: StatsRequest, owner_id: str) -> ColumnStats:
+    """Perfil descriptivo de una columna: conteos, mín/máx, suma/promedio y top valores."""
+    detail, valid_columns = _require_ready_columns(dataset_id, owner_id)
+    column_sql = quote_column(request.column, valid_columns)
+    numeric = request.column in _numeric_columns(detail)
+    where_sql, where_params = build_where(request.filter, valid_columns)
+    parquet = parquet_locator(dataset_id)
+
+    row = duckdb_engine.column_stats(parquet, column_sql, where_sql, where_params, numeric)
+    total, non_null, distinct = int(row[0]), int(row[1]), int(row[2])
+    top = duckdb_engine.column_top_values(
+        parquet, column_sql, where_sql, where_params, _STATS_TOP_LIMIT
+    )
+    return ColumnStats(
+        column=request.column,
+        is_numeric=numeric,
+        total=total,
+        non_null=non_null,
+        nulls=total - non_null,
+        distinct=distinct,
+        minimum=_scalar(row[3]),
+        maximum=_scalar(row[4]),
+        total_sum=row[5] if numeric else None,
+        average=row[6] if numeric else None,
+        top_values=[TopValue(value=value, count=count) for value, count in top],
+    )
+
+
+def _scalar(value: object) -> str | float | int | None:
+    """Normaliza un mín/máx para la respuesta: números tal cual, el resto como texto."""
+    if value is None or isinstance(value, (int, float)):
+        return value
+    return str(value)
 
 
 # ---------------------------------------------------------------------------
