@@ -1,11 +1,21 @@
 """Ingesta: convertir el archivo original a Parquet + registrar su esquema.
 
-Funciona con disco local o con R2 (según configuración). Se ejecuta de forma
-asíncrona (background task) porque convertir millones de filas puede tardar.
+El trabajo pesado (DuckDB cargando/convirtiendo millones de filas) corre en un
+PROCESO HIJO efímero, no en el proceso web. Al morir el hijo, el SO recupera el
+100% de su memoria —cosa que liberar dentro del proceso no logra por la retención
+del asignador nativo—, de modo que el proceso web se mantiene en su línea base.
+
+Un pool compartido y acotado (`ingest_max_workers`) limita cuántas conversiones
+corren a la vez: el resto quedan en cola, así subir muchos archivos nunca desborda
+la RAM. El proceso web es el ÚNICO que escribe en la BD (estado del dataset), vía
+un callback cuando el hijo termina. Funciona con disco local o con R2.
 """
 import logging
+import multiprocessing
 import os
 import tempfile
+from concurrent.futures import Future, ProcessPoolExecutor
+from functools import partial
 
 from app.core import storage
 from app.core.config import get_settings
@@ -13,7 +23,7 @@ from app.repositories import dataset_repository as repo
 from app.repositories import duckdb_engine
 from app.repositories import r2_client
 from app.repositories.duckdb_engine import EXCEL_EXTENSIONS, EncodingNotSupported
-from app.schemas.dataset import IngestStatus
+from app.schemas.dataset import ColumnInfo, IngestStatus
 
 logger = logging.getLogger(__name__)
 
@@ -22,34 +32,110 @@ logger = logging.getLogger(__name__)
 _FALLBACK_ENCODING = "cp1252"
 _TRANSCODE_CHUNK = 1024 * 1024  # 1 MiB de caracteres por iteración (memoria plana)
 
+# "spawn" (no "fork"): arranca un intérprete limpio por hijo y evita deadlocks al
+# forkear un proceso con hilos/async (uvicorn). Mismo patrón que la plataforma.
+_MP_CONTEXT = multiprocessing.get_context("spawn")
+_pool: ProcessPoolExecutor | None = None
 
-def run_ingest(dataset_id: str, sheet: str | None = None) -> None:
-    """Procesa un dataset ya subido: original -> Parquet + esquema.
 
-    Para Excel detecta las hojas (descargando una copia local si está en R2) y usa
-    la indicada o la primera. Nunca propaga el stack al cliente: ante un fallo guarda
-    un mensaje corto y marca el dataset como FAILED.
+def _get_pool() -> ProcessPoolExecutor:
+    """Pool de procesos compartido para las conversiones pesadas (lazy singleton).
+
+    - `max_workers` acota cuántas conversiones corren a la vez (y por tanto el pico
+      de RAM); las que exceden el tope quedan en cola (backpressure).
+    - `max_tasks_per_child=1`: cada conversión usa un proceso NUEVO que se descarta
+      al terminar, garantizando que el SO recupere toda su memoria.
+    """
+    global _pool
+    if _pool is None:
+        _pool = ProcessPoolExecutor(
+            max_workers=max(1, get_settings().ingest_max_workers),
+            mp_context=_MP_CONTEXT,
+            max_tasks_per_child=1,
+        )
+    return _pool
+
+
+def shutdown_pool() -> None:
+    """Cierra el pool al apagar la app (invocado desde el lifespan de FastAPI)."""
+    global _pool
+    if _pool is not None:
+        _pool.shutdown(wait=False, cancel_futures=True)
+        _pool = None
+
+
+def submit_ingest(dataset_id: str, sheet: str | None = None) -> None:
+    """Encola la conversión a Parquet en un proceso hijo efímero (no bloquea).
+
+    Marca el dataset como PROCESSING y delega el trabajo pesado al pool. Cuando el
+    hijo termina, `_on_ingest_done` persiste el resultado o el fallo. El proceso web
+    nunca carga el archivo en su propia memoria.
     """
     extension = repo.get_extension(dataset_id)
     if extension is None:
         logger.warning("Ingesta abortada: dataset %s inexistente", dataset_id)
         return
+    repo.set_status(dataset_id, IngestStatus.PROCESSING)
+    payload = {"dataset_id": dataset_id, "extension": extension, "sheet": sheet}
+    try:
+        future = _get_pool().submit(_convert_in_subprocess, payload)
+    except Exception:  # noqa: BLE001 - p. ej. pool caído durante el apagado
+        logger.exception("No se pudo encolar la ingesta del dataset %s", dataset_id)
+        repo.set_status(dataset_id, IngestStatus.FAILED,
+                        error="No se pudo iniciar el procesamiento. Inténtalo de nuevo.")
+        return
+    future.add_done_callback(partial(_on_ingest_done, dataset_id))
 
+
+def _on_ingest_done(dataset_id: str, future: Future) -> None:
+    """Persiste el resultado del hijo. Corre en un hilo del pool (proceso web).
+
+    Único punto que escribe el estado final: si el hijo lanzó una excepción o murió
+    (OOM/crash), queda como FAILED; si no, se guardan hojas, columnas y nº de filas.
+    """
+    try:
+        result = future.result()
+    except Exception as exc:  # noqa: BLE001 - el hijo falló o murió -> mensaje corto al cliente
+        logger.exception("Fallo de ingesta para dataset %s", dataset_id)
+        repo.set_status(dataset_id, IngestStatus.FAILED, error=_friendly_error(exc))
+        return
+    if result["sheets"] is not None:  # solo Excel reporta hojas
+        repo.set_sheets(dataset_id, result["sheets"], result["active_sheet"])
+    columns = [ColumnInfo(**col) for col in result["columns"]]
+    repo.set_ready(dataset_id, columns, result["row_count"])
+    logger.info("Ingesta OK: dataset %s (%d filas)", dataset_id, result["row_count"])
+
+
+def _convert_in_subprocess(payload: dict) -> dict:
+    """Punto de entrada del proceso hijo (target picklable del pool).
+
+    NO toca la base de datos: lee el crudo, lo convierte a Parquet y devuelve un
+    resumen liviano (columnas, filas, hojas) que el proceso web persiste. Lanza
+    ante un error; el padre lo traduce a un mensaje accionable para el cliente.
+    """
+    return _convert(payload["dataset_id"], payload["extension"], payload["sheet"])
+
+
+def _convert(dataset_id: str, extension: str, sheet: str | None) -> dict:
+    """Conversión pura original -> Parquet. Devuelve el resumen o lanza.
+
+    Para Excel detecta las hojas (descargando una copia local si está en R2) y usa
+    la indicada o la primera. Limpia siempre sus temporales.
+    """
     settings = get_settings()
     dest_locator = storage.parquet_locator(dataset_id)
     is_excel = extension.lower() in EXCEL_EXTENSIONS
     temp_files: list[str] = []  # temporales a limpiar (descargas de R2, transcodificados)
-
-    repo.set_status(dataset_id, IngestStatus.PROCESSING)
+    sheets: list[str] | None = None
+    active_sheet: str | None = None
     try:
         if is_excel:
             local_raw, temp = _local_raw_copy(dataset_id, extension, settings)
             _track(temp_files, temp)
             sheets = duckdb_engine.list_xlsx_sheets(local_raw)
-            chosen = sheet if sheet in sheets else (sheets[0] if sheets else None)
-            repo.set_sheets(dataset_id, sheets, chosen)
+            active_sheet = sheet if sheet in sheets else (sheets[0] if sheets else None)
             columns, row_count = duckdb_engine.convert_to_parquet(
-                local_raw, dest_locator, extension, chosen
+                local_raw, dest_locator, extension, active_sheet
             )
         else:
             columns, row_count = _ingest_csv(
@@ -61,12 +147,12 @@ def run_ingest(dataset_id: str, sheet: str | None = None) -> None:
         # una columna fantasma en archivos vacíos, por eso el signo fiable es el nº de filas).
         if not columns or row_count == 0:
             raise ValueError("El archivo no contiene filas de datos. Revisa que no esté vacío.")
-        repo.set_ready(dataset_id, columns, row_count)
-        logger.info("Ingesta OK: dataset %s (%d filas, hoja=%s)", dataset_id, row_count,
-                    sheet if is_excel else "-")
-    except Exception as exc:  # noqa: BLE001 - se registra completo, al cliente va mensaje corto
-        logger.exception("Fallo de ingesta para dataset %s", dataset_id)
-        repo.set_status(dataset_id, IngestStatus.FAILED, error=_friendly_error(exc))
+        return {
+            "columns": [col.model_dump() for col in columns],
+            "row_count": row_count,
+            "sheets": sheets,
+            "active_sheet": active_sheet,
+        }
     finally:
         for path in temp_files:
             if os.path.exists(path):

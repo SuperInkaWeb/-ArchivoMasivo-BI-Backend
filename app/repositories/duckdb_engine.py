@@ -12,7 +12,9 @@ Notas de seguridad:
   - Los VALORES de filtro se pasan SIEMPRE como parámetros ('?') enlazados.
 """
 import logging
+import os
 import zipfile
+from pathlib import Path
 from xml.etree import ElementTree
 
 import duckdb
@@ -111,10 +113,26 @@ def list_xlsx_sheets(local_path: str) -> list[str]:
     ]
 
 
+def _apply_memory_guards(con: duckdb.DuckDBPyConnection) -> None:
+    """Acota la RAM de DuckDB y habilita el volcado a disco.
+
+    Dentro de un contenedor DuckDB puede detectar la RAM del host (mayor que el
+    límite real) y provocar OOM; `memory_limit` acota el pico y, al superarlo,
+    DuckDB vuelca a `temp_directory` en lugar de seguir creciendo en memoria.
+    """
+    settings = get_settings()
+    if settings.duckdb_memory_limit:
+        con.execute(f"SET memory_limit={_sql_str(settings.duckdb_memory_limit)}")
+    temp_dir = settings.duckdb_temp_dir or str(Path(settings.data_dir) / "duckdb_tmp")
+    os.makedirs(temp_dir, exist_ok=True)
+    con.execute(f"SET temp_directory={_sql_str(temp_dir)}")
+
+
 def _connect() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     # preserve_insertion_order=false reduce el uso de memoria en cargas grandes.
     con.execute("SET preserve_insertion_order = false")
+    _apply_memory_guards(con)
     # La extensión excel habilita read_xlsx / COPY ... (FORMAT xlsx).
     try:
         con.execute("INSTALL excel")

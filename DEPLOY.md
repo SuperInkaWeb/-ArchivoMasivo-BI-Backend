@@ -126,7 +126,27 @@ DuckDB lee/escribe el Parquet en R2. Si no defines las 4 variables R2, el backen
 
 ## Referencia rápida de variables
 
-**Backend (Railway):** `DATABASE_URL`, `AUTH_ENABLED`, `AUTH0_DOMAIN`, `AUTH0_AUDIENCE`, `CORS_ORIGINS`, `MAX_UPLOAD_MB`, `MAX_DOWNLOAD_ROWS`.
+**Backend (Railway):** `DATABASE_URL`, `AUTH_ENABLED`, `AUTH0_DOMAIN`, `AUTH0_AUDIENCE`, `CORS_ORIGINS`, `MAX_UPLOAD_MB`, `MAX_DOWNLOAD_ROWS`, `INGEST_MAX_WORKERS`, `DUCKDB_MEMORY_LIMIT`.
+
+---
+
+## 7. Memoria y costo (importante en Railway)
+
+La conversión pesada corre en un **proceso hijo efímero**: al terminar muere y el SO
+recupera el 100% de su RAM, de modo que el proceso web vuelve a su línea base (~165 MB)
+en vez de quedarse inflado. Railway factura por RAM usada, así que esto evita pagar el
+pico mientras la app está ociosa.
+
+Dos variables controlan el equilibrio memoria/throughput:
+
+| Variable | Qué hace | Recomendado |
+|---|---|---|
+| `INGEST_MAX_WORKERS` | Conversiones en paralelo. El resto se **encola** (subir muchos archivos nunca desborda la RAM). | `1` (súbelo solo si tienes RAM de sobra) |
+| `DUCKDB_MEMORY_LIMIT` | Tope de RAM por conversión; al superarlo DuckDB **vuelca a disco** en vez de inflar la RAM. Evita OOM cuando DuckDB ve la RAM del host y no la del contenedor. | ≈ `(RAM del contenedor / INGEST_MAX_WORKERS)` menos ~400 MB de margen |
+
+> **Opcional (costo cero): App Sleeping.** En Railway → servicio → **Settings → Serverless**,
+> activa el modo que duerme el servicio cuando no hay tráfico. Mientras duerme no pagas RAM;
+> la primera petición al volver tarda unos segundos (cold start). Útil para uso esporádico.
 
 **Frontend (Vercel):** `VITE_API_URL`, `VITE_AUTH_ENABLED`, `VITE_AUTH0_DOMAIN`, `VITE_AUTH0_CLIENT_ID`, `VITE_AUTH0_AUDIENCE`.
 

@@ -50,6 +50,24 @@ class Settings(BaseSettings):
     rate_limit_upload: str = "10/minute"
     rate_limit_download: str = "20/minute"
 
+    # Ingesta en subproceso: nº máximo de conversiones pesadas EN PARALELO. Cada
+    # conversión corre en un proceso hijo efímero cuya memoria el SO recupera al
+    # terminar. Las subidas que exceden este tope quedan en cola (no se rechazan),
+    # por lo que subir muchos archivos nunca desborda la RAM: se procesan por
+    # tandas. Subirlo mejora el throughput pero multiplica el pico de memoria
+    # (≈ ingest_max_workers × duckdb_memory_limit). Railway factura por RAM usada.
+    ingest_max_workers: int = 1
+
+    # Límite de memoria de DuckDB por conexión (p. ej. "1500MB"). Vacío = DuckDB
+    # decide (≈80% de la RAM que detecta), que dentro de un contenedor puede
+    # superar el límite real y provocar OOM. Definirlo acota el pico y fuerza el
+    # volcado a disco (temp_directory) en vez de inflar la RAM.
+    duckdb_memory_limit: str = ""
+
+    # Carpeta de volcado temporal de DuckDB al superar memory_limit. Vacío = una
+    # subcarpeta bajo data_dir (efímera en Railway, suficiente para el volcado).
+    duckdb_temp_dir: str = ""
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

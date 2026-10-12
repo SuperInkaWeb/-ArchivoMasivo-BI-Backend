@@ -29,6 +29,7 @@ from app.services.dataset_service import (
     UnsupportedFileTypeError,
     UploadIncompleteError,
 )
+from app.services.ingest_service import shutdown_pool
 
 logging.basicConfig(level=logging.INFO)
 
@@ -37,6 +38,7 @@ logging.basicConfig(level=logging.INFO)
 async def lifespan(_: FastAPI):
     init_db()
     yield
+    shutdown_pool()  # cierra el pool de subprocesos de ingesta al apagar
 
 
 def _json_error(status_code: int, message: str) -> JSONResponse:

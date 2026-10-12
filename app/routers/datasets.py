@@ -21,7 +21,7 @@ from app.schemas.dataset import (
 )
 from app.schemas.filter import DistinctValuesResponse
 from app.services import dataset_service
-from app.services.ingest_service import run_ingest
+from app.services.ingest_service import submit_ingest
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
@@ -55,7 +55,7 @@ def confirm_upload(
 ) -> DatasetSummary:
     """Paso 3: confirma la subida y dispara la ingesta (conversión a Parquet)."""
     summary = dataset_service.confirm_uploaded(dataset_id, user.sub)
-    background_tasks.add_task(run_ingest, dataset_id)
+    background_tasks.add_task(submit_ingest, dataset_id)
     return summary
 
 
@@ -91,7 +91,7 @@ def change_sheet(
 ) -> DatasetDetail:
     """Re-ingesta el Excel usando otra hoja (procesa en segundo plano)."""
     dataset_service.request_sheet_change(dataset_id, selection.sheet, user.sub)
-    background_tasks.add_task(run_ingest, dataset_id, selection.sheet)
+    background_tasks.add_task(submit_ingest, dataset_id, selection.sheet)
     return dataset_service.get_dataset(dataset_id, user.sub)
 
 
