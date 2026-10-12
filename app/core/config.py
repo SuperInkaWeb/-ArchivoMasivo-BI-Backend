@@ -50,11 +50,12 @@ class Settings(BaseSettings):
     rate_limit_upload: str = "10/minute"
     rate_limit_download: str = "20/minute"
 
-    # Ingesta en subproceso: nº máximo de conversiones pesadas EN PARALELO. Cada
-    # conversión corre en un proceso hijo efímero cuya memoria el SO recupera al
-    # terminar. Las subidas que exceden este tope quedan en cola (no se rechazan),
-    # por lo que subir muchos archivos nunca desborda la RAM: se procesan por
-    # tandas. Subirlo mejora el throughput pero multiplica el pico de memoria
+    # Trabajo pesado de DuckDB en subproceso: nº máximo de operaciones EN PARALELO
+    # (conversiones de ingesta + materializaciones de análisis comparten el pool).
+    # Cada una corre en un proceso hijo efímero cuya memoria el SO recupera al
+    # terminar. Lo que excede este tope queda en cola (no se rechaza), por lo que
+    # disparar muchas operaciones nunca desborda la RAM: se procesan por tandas.
+    # Subirlo mejora el throughput pero multiplica el pico de memoria
     # (≈ ingest_max_workers × duckdb_memory_limit). Railway factura por RAM usada.
     ingest_max_workers: int = 1
 

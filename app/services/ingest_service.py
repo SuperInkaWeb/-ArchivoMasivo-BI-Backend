@@ -11,14 +11,14 @@ la RAM. El proceso web es el ÚNICO que escribe en la BD (estado del dataset), v
 un callback cuando el hijo termina. Funciona con disco local o con R2.
 """
 import logging
-import multiprocessing
 import os
 import tempfile
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future
 from functools import partial
 
 from app.core import storage
 from app.core.config import get_settings
+from app.core.process_pool import get_pool
 from app.repositories import dataset_repository as repo
 from app.repositories import duckdb_engine
 from app.repositories import r2_client
@@ -31,37 +31,6 @@ logger = logging.getLogger(__name__)
 # SUNAT exporta desde Windows: cp1252 mapea correctamente la puntuación del rango C1.
 _FALLBACK_ENCODING = "cp1252"
 _TRANSCODE_CHUNK = 1024 * 1024  # 1 MiB de caracteres por iteración (memoria plana)
-
-# "spawn" (no "fork"): arranca un intérprete limpio por hijo y evita deadlocks al
-# forkear un proceso con hilos/async (uvicorn). Mismo patrón que la plataforma.
-_MP_CONTEXT = multiprocessing.get_context("spawn")
-_pool: ProcessPoolExecutor | None = None
-
-
-def _get_pool() -> ProcessPoolExecutor:
-    """Pool de procesos compartido para las conversiones pesadas (lazy singleton).
-
-    - `max_workers` acota cuántas conversiones corren a la vez (y por tanto el pico
-      de RAM); las que exceden el tope quedan en cola (backpressure).
-    - `max_tasks_per_child=1`: cada conversión usa un proceso NUEVO que se descarta
-      al terminar, garantizando que el SO recupere toda su memoria.
-    """
-    global _pool
-    if _pool is None:
-        _pool = ProcessPoolExecutor(
-            max_workers=max(1, get_settings().ingest_max_workers),
-            mp_context=_MP_CONTEXT,
-            max_tasks_per_child=1,
-        )
-    return _pool
-
-
-def shutdown_pool() -> None:
-    """Cierra el pool al apagar la app (invocado desde el lifespan de FastAPI)."""
-    global _pool
-    if _pool is not None:
-        _pool.shutdown(wait=False, cancel_futures=True)
-        _pool = None
 
 
 def submit_ingest(dataset_id: str, sheet: str | None = None) -> None:
@@ -78,7 +47,7 @@ def submit_ingest(dataset_id: str, sheet: str | None = None) -> None:
     repo.set_status(dataset_id, IngestStatus.PROCESSING)
     payload = {"dataset_id": dataset_id, "extension": extension, "sheet": sheet}
     try:
-        future = _get_pool().submit(_convert_in_subprocess, payload)
+        future = get_pool().submit(_convert_in_subprocess, payload)
     except Exception:  # noqa: BLE001 - p. ej. pool caído durante el apagado
         logger.exception("No se pudo encolar la ingesta del dataset %s", dataset_id)
         repo.set_status(dataset_id, IngestStatus.FAILED,

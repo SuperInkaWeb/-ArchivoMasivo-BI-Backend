@@ -10,6 +10,8 @@ Un dataset derivado es uno más: se puede filtrar, previsualizar y descargar
 """
 import logging
 import uuid
+from concurrent.futures import Future
+from functools import partial
 from typing import Callable
 
 from app.core.config import get_settings
@@ -17,6 +19,7 @@ from app.core.exceptions import DatasetNotReadyError
 from app.core.dedupe_builder import build_dedupe
 from app.core.expression_builder import build_expression
 from app.core.pivot_builder import MAX_PIVOT_COLUMNS, build_pivot, build_pivot_totals
+from app.core.process_pool import get_pool
 from app.core.query_builder import InvalidFilterError, build_where, quote_column
 from app.core.replace_builder import build_replace_select
 from app.core.storage import parquet_key, parquet_locator, parquet_path
@@ -45,7 +48,13 @@ from app.schemas.analysis import (
     StatsRequest,
     TopValue,
 )
-from app.schemas.dataset import DatasetDetail, DatasetOrigin, DatasetSummary, IngestStatus
+from app.schemas.dataset import (
+    ColumnInfo,
+    DatasetDetail,
+    DatasetOrigin,
+    DatasetSummary,
+    IngestStatus,
+)
 from app.schemas.filter import DownloadFormat, PreviewResponse, SortDirection
 from app.services import dataset_service, export_service
 
@@ -109,16 +118,22 @@ def start_pivot_save(dataset_id: str, request: PivotSaveRequest, owner_id: str) 
 
 
 def run_pivot_save(new_id: str, source_id: str, request: PivotSaveRequest, owner_id: str) -> None:
-    """Tarea en segundo plano: materializa el pivote a Parquet y marca READY/FAILED."""
-    def materialize() -> None:
+    """Encola la materialización del pivote en un subproceso (no bloquea)."""
+    def build_payload() -> dict:
         select_sql, group_cols_sql, order_sql, where_sql, params, where_params = _plan_pivot(
             source_id, request, owner_id
         )
-        duckdb_engine.pivot_to_parquet(
-            parquet_locator(source_id), select_sql, group_cols_sql, where_sql,
-            params + where_params, parquet_locator(new_id), order_sql,
-        )
-    _finalize_derived(new_id, source_id, materialize)
+        return {
+            "kind": "pivot",
+            "source": parquet_locator(source_id),
+            "dest": parquet_locator(new_id),
+            "select_sql": select_sql,
+            "group_cols_sql": group_cols_sql,
+            "where_sql": where_sql,
+            "order_sql": order_sql,
+            "params": params + where_params,
+        }
+    _materialize_derived(new_id, source_id, build_payload)
 
 
 def export_pivot(dataset_id: str, request: PivotDownloadRequest, owner_id: str) -> export_service.ExportResult:
@@ -232,16 +247,20 @@ def start_compute_save(dataset_id: str, request: ComputeSaveRequest, owner_id: s
 
 
 def run_compute_save(new_id: str, source_id: str, request: ComputeSaveRequest, owner_id: str) -> None:
-    """Tarea en segundo plano: materializa las columnas calculadas y marca READY/FAILED."""
-    def materialize() -> None:
+    """Encola la materialización de las columnas calculadas en un subproceso."""
+    def build_payload() -> dict:
         _, valid_columns = _require_ready_columns(source_id, owner_id)
         where_sql, where_params = build_where(request.filter, valid_columns)
         select_sql, compute_params = _compute_select(request, valid_columns)
-        duckdb_engine.materialize_to_parquet(
-            parquet_locator(source_id), select_sql, where_sql,
-            compute_params + where_params, parquet_locator(new_id),
-        )
-    _finalize_derived(new_id, source_id, materialize)
+        return {
+            "kind": "materialize",
+            "source": parquet_locator(source_id),
+            "dest": parquet_locator(new_id),
+            "select_sql": select_sql,
+            "where_sql": where_sql,
+            "params": compute_params + where_params,
+        }
+    _materialize_derived(new_id, source_id, build_payload)
 
 
 def export_compute(dataset_id: str, request: ComputeDownloadRequest, owner_id: str) -> export_service.ExportResult:
@@ -311,14 +330,18 @@ def start_replace_save(dataset_id: str, request: ReplaceSaveRequest, owner_id: s
 
 
 def run_replace_save(new_id: str, source_id: str, request: ReplaceSaveRequest, owner_id: str) -> None:
-    """Tarea en segundo plano: materializa las correcciones y marca READY/FAILED."""
-    def materialize() -> None:
+    """Encola la materialización de las correcciones en un subproceso."""
+    def build_payload() -> dict:
         _, select_sql, where_sql, params, where_params = _plan_replace(source_id, request, owner_id)
-        duckdb_engine.materialize_to_parquet(
-            parquet_locator(source_id), select_sql, where_sql,
-            params + where_params, parquet_locator(new_id),
-        )
-    _finalize_derived(new_id, source_id, materialize)
+        return {
+            "kind": "materialize",
+            "source": parquet_locator(source_id),
+            "dest": parquet_locator(new_id),
+            "select_sql": select_sql,
+            "where_sql": where_sql,
+            "params": params + where_params,
+        }
+    _materialize_derived(new_id, source_id, build_payload)
 
 
 def export_replace(dataset_id: str, request: ReplaceDownloadRequest, owner_id: str) -> export_service.ExportResult:
@@ -378,14 +401,19 @@ def start_dedupe_save(dataset_id: str, request: DedupeSaveRequest, owner_id: str
 
 
 def run_dedupe_save(new_id: str, source_id: str, request: DedupeSaveRequest, owner_id: str) -> None:
-    """Tarea en segundo plano: materializa el resultado sin duplicados y marca READY/FAILED."""
-    def materialize() -> None:
+    """Encola la materialización del resultado sin duplicados en un subproceso."""
+    def build_payload() -> dict:
         _, select_sql, where_sql, qualify_sql, where_params = _plan_dedupe(source_id, request, owner_id)
-        duckdb_engine.dedupe_to_parquet(
-            parquet_locator(source_id), select_sql, where_sql, qualify_sql,
-            where_params, parquet_locator(new_id),
-        )
-    _finalize_derived(new_id, source_id, materialize)
+        return {
+            "kind": "dedupe",
+            "source": parquet_locator(source_id),
+            "dest": parquet_locator(new_id),
+            "select_sql": select_sql,
+            "where_sql": where_sql,
+            "qualify_sql": qualify_sql,
+            "params": where_params,
+        }
+    _materialize_derived(new_id, source_id, build_payload)
 
 
 def export_dedupe(dataset_id: str, request: DedupeDownloadRequest, owner_id: str) -> export_service.ExportResult:
@@ -479,21 +507,74 @@ def _start_derived(owner_id: str, name: str, origin: DatasetOrigin) -> DatasetSu
     return repo.get_detail(new_id, owner_id)
 
 
-def _finalize_derived(new_id: str, source_id: str, materialize: Callable[[], None]) -> None:
-    """Ejecuta la materialización y marca READY/FAILED (patrón común pivote/compute)."""
+def _materialize_derived(new_id: str, source_id: str, build_payload: Callable[[], dict]) -> None:
+    """Planifica (en el web), encola la materialización en un subproceso y registra
+    el callback que persiste el estado. El trabajo pesado de DuckDB corre en un
+    proceso hijo efímero cuya RAM el SO recupera al terminar; el web es el único
+    que escribe el estado del dataset.
+    """
     try:
-        materialize()
-        dest = parquet_locator(new_id)
-        columns = duckdb_engine.get_schema(dest)
-        row_count = duckdb_engine.count_matches(dest, "", [])
-        if not columns or row_count == 0:
-            raise ValueError("No se generó ninguna fila.")
-        repo.set_ready(new_id, columns, row_count)
-        repo.set_size(new_id, _parquet_size(new_id))
-        logger.info("Dataset derivado %s listo (%d filas) desde %s", new_id, row_count, source_id)
-    except Exception as exc:  # noqa: BLE001 - stack al log, mensaje corto al cliente
+        payload = build_payload()  # valida y arma el SQL (lectura de metadatos en el web)
+    except Exception as exc:  # noqa: BLE001 - error de validación/plan -> FAILED con mensaje corto
+        logger.exception("Fallo al planificar el dataset derivado %s desde %s", new_id, source_id)
+        repo.set_status(new_id, IngestStatus.FAILED, error=_friendly_error(exc))
+        return
+    try:
+        future = get_pool().submit(_materialize, payload)
+    except Exception:  # noqa: BLE001 - p. ej. pool caído durante el apagado
+        logger.exception("No se pudo encolar la materialización de %s", new_id)
+        repo.set_status(new_id, IngestStatus.FAILED,
+                        error="No se pudo iniciar el procesamiento. Inténtalo de nuevo.")
+        return
+    future.add_done_callback(partial(_on_materialize_done, new_id, source_id))
+
+
+def _materialize(payload: dict) -> dict:
+    """Punto de entrada del proceso hijo (target picklable del pool).
+
+    Ejecuta el COPY pesado hacia el Parquet destino según el tipo de operación y
+    devuelve un resumen liviano (columnas + nº de filas). No toca la BD; lanza ante
+    un error (el padre lo traduce a un mensaje para el cliente).
+    """
+    kind = payload["kind"]
+    if kind == "pivot":
+        duckdb_engine.pivot_to_parquet(
+            payload["source"], payload["select_sql"], payload["group_cols_sql"],
+            payload["where_sql"], payload["params"], payload["dest"], payload["order_sql"],
+        )
+    elif kind == "materialize":  # columnas calculadas y buscar/reemplazar
+        duckdb_engine.materialize_to_parquet(
+            payload["source"], payload["select_sql"], payload["where_sql"],
+            payload["params"], payload["dest"],
+        )
+    elif kind == "dedupe":
+        duckdb_engine.dedupe_to_parquet(
+            payload["source"], payload["select_sql"], payload["where_sql"],
+            payload["qualify_sql"], payload["params"], payload["dest"],
+        )
+    else:  # defensa: nunca debería ocurrir (kind lo fija el servicio)
+        raise ValueError(f"Tipo de materialización no soportado: {kind}")
+
+    dest = payload["dest"]
+    columns = duckdb_engine.get_schema(dest)
+    row_count = duckdb_engine.count_matches(dest, "", [])
+    if not columns or row_count == 0:
+        raise ValueError("No se generó ninguna fila.")
+    return {"columns": [col.model_dump() for col in columns], "row_count": row_count}
+
+
+def _on_materialize_done(new_id: str, source_id: str, future: Future) -> None:
+    """Persiste el resultado del hijo. Corre en un hilo del pool (proceso web)."""
+    try:
+        result = future.result()
+    except Exception as exc:  # noqa: BLE001 - el hijo falló o murió -> mensaje corto al cliente
         logger.exception("Fallo al generar el dataset derivado %s desde %s", new_id, source_id)
         repo.set_status(new_id, IngestStatus.FAILED, error=_friendly_error(exc))
+        return
+    columns = [ColumnInfo(**col) for col in result["columns"]]
+    repo.set_ready(new_id, columns, result["row_count"])
+    repo.set_size(new_id, _parquet_size(new_id))
+    logger.info("Dataset derivado %s listo (%d filas) desde %s", new_id, result["row_count"], source_id)
 
 
 def _parquet_size(dataset_id: str) -> int:

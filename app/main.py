@@ -29,7 +29,7 @@ from app.services.dataset_service import (
     UnsupportedFileTypeError,
     UploadIncompleteError,
 )
-from app.services.ingest_service import shutdown_pool
+from app.core.process_pool import shutdown_pool
 
 logging.basicConfig(level=logging.INFO)
 
